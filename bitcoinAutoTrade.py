@@ -1,6 +1,6 @@
 import time
 import pyupbit
-import datetime
+import math
 
 access = "rIGYfaNMhpNrKgUhxAEsSNONjTx6Br6nblxQu0nE"
 secret = "xopBplK0MWlPuTaf9V197Xgtb1hC02LnPAvkHmvo"
@@ -29,12 +29,12 @@ try:
     current_price = get_current_price("KRW-CRE")
     min_price = 12.0
     max_price = 17.0
-    set_balance = 5100
+    set_balance = 10000
     de_price = 0.1
-    my_krw = get_balance("KRW") 
+    my_cash = get_balance("KRW") 
     last_done = pyupbit.get_current_price("KRW-CRE")
 
-    if my_krw > set_balance : 
+    if my_cash > set_balance : 
         #현재가 매수
         buy_coin = set_balance/current_price
         upbit.buy_limit_order("KRW-CRE", current_price, buy_coin)
@@ -46,8 +46,8 @@ try:
         frt_price = upbit.get_order(frt_uuid).get('price')
         print("!!!!frt_uuid : {}".format(frt_uuid))
 
-        my_krw = get_balance("KRW")
-        cnt = my_krw/set_balance
+        my_cash = get_balance("KRW")
+        cnt = my_cash/set_balance
         #최초 매수가 아래로 매수 주문
         while cnt >= 0 and float(frt_price) >= min_price:
             frt_price=float(frt_price)-de_price # 매수할 호가 지정
@@ -90,9 +90,10 @@ try:
                         frt_uuid = aft_uuid
                 elif str_side == 'ask': #매도 (매수 예약 필요.)
                     fl_price-=de_price
-                    my_cre = get_balance("CRE")
+                    my_cash = get_balance("KRW")
+                    cnt_maesoo = math.trunc(my_cash/set_balance)
                     ord_buy_coin = set_balance/fl_price
-                    if my_cre > ord_buy_coin:
+                    if cnt_maesoo > 0:
                         upbit.buy_limit_order("KRW-CRE", fl_price, ord_buy_coin)
                         print("!!!!Buy check uuid : {}".format(aft_uuid))
                         frt_uuid = aft_uuid
