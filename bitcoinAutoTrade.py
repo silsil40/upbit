@@ -74,10 +74,34 @@ try:
         while True:
             num = 0
             get_orderd = upbit.get_order("KRW-CRE", state="done")
-            str_side = list(get_orderd)[num].get('side')
-            fl_price = float(list(get_orderd)[num].get('price'))
-            aft_uuid = list(get_orderd)[num].get('uuid')
+            dne_ordcnt = len(list(get_orderd))
+            last_uuid = 0
+            first_in = 0
+            confirm_dt = 0
+            after_dt= 0
+            #마지막 체결된 시간으로 uuid 가져오기.
+            while dne_ordcnt > 0:
+                pre_uuid = list(get_orderd)[dne_ordcnt-1].get('uuid')
+                if first_in == 0:
+                    confirm_dt = list(upbit.get_order(pre_uuid).get('trades'))[0].get('created_at')
+                    first_in+=1
+                else:
+                    after_dt = list(upbit.get_order(pre_uuid).get('trades'))[0].get('created_at')
 
+                #큰값으로 교체
+                #print("이전값 : {}".format(confirm_dt))
+                #print("비교값 : {}".format(after_dt))
+                if str(after_dt) > confirm_dt:
+                    confirm_dt = after_dt
+                    last_uuid = pre_uuid
+
+                dne_ordcnt-=1  
+
+            str_side = upbit.get_order(last_uuid).get('side')
+            fl_price = float(upbit.get_order(last_uuid).get('price'))
+            aft_uuid = last_uuid
+
+            #최초 uuid와 최근 체결된 uuid 비교
             if frt_uuid != aft_uuid: #최초 체결된 거래는 제외.
                 if str_side == 'bid': #매수 (매도 예약 필요)
                     fl_price+=de_price
@@ -94,7 +118,8 @@ try:
                     cnt_maesoo = math.trunc(my_cash/set_balance)
                     ord_buy_coin = set_balance/fl_price
                     if cnt_maesoo > 0:
-                        upbit.buy_limit_order("KRW-CRE", fl_price, ord_buy_coin)
+                        upbit.buy_limit_order("KRW-CRE", round(fl_price,2), ord_buy_coin)
+                        print("Add Order Buy Coin!!!! {}".format(round(fl_price,2)))
                         print("!!!!Buy check uuid : {}".format(aft_uuid))
                         frt_uuid = aft_uuid
 
