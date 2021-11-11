@@ -27,12 +27,11 @@ print("autotrade start")
 #자동매매 시작
 try:
     current_price = get_current_price("KRW-CRE")
-    min_price = 12.0
-    max_price = 17.0
+    min_price = 11.0
+    max_price = 20.0
     set_balance = 10000
-    de_price = 0.1
+    de_price = 0.3
     my_cash = get_balance("KRW") 
-    last_done = pyupbit.get_current_price("KRW-CRE")
 
     if my_cash > set_balance : 
         #현재가 매수
@@ -131,36 +130,39 @@ try:
                         tt = 0
                         ch_price = 0
                         pri_size = len(list(maedo_list))
-                        while pri_size > 0:
-                            
-                            trans_type = list(maedo_list)[pri_size-1].get('side')
-                            if trans_type == 'ask':
-                                if firstin == 0:
-                                    tt = list(maedo_list)[pri_size-1].get('price') 
-                                    firstin+=1
-                                else:
-                                    ch_price = list(maedo_list)[pri_size-1].get('price')
-
-                                #큰값으로 교체
-                                #print("이전값 : {}".format(float(tt)))
-                                #print("비교값 : {}".format(float(ch_price)))
-                                if float(ch_price) > float(tt):
-                                    tt = ch_price
-
-                            pri_size-=1    
-                                
-                        print("!!!!max buy orderd price!!!! {}".format(tt))
-                        #최대금액+ 기준호가 금액으로 매도 추가
                         my_cre = get_balance("CRE")
-                        while my_cre > (set_balance/(float(tt)+de_price)):
-                            tt=float(tt)+de_price # 매도할 호가 지정
-                            sell_coin = set_balance/float(tt)
-                            if my_cre > sell_coin:
-                                upbit.sell_limit_order("KRW-CRE", round(tt,2), sell_coin)
-                                my_cre = get_balance("CRE")
-                                print("Order Sell Coin!!!!")
-                                print("Order Sell Coin!!!! : {}".format(round(tt,2)))
-                            time.sleep(1)
+                        if my_cre > ord_buy_coin:
+                            while pri_size > 0:
+                                
+                                trans_type = list(maedo_list)[pri_size-1].get('side')
+                                if trans_type == 'ask':
+                                    if firstin == 0:
+                                        tt = list(maedo_list)[pri_size-1].get('price') 
+                                        firstin+=1
+                                    else:
+                                        ch_price = list(maedo_list)[pri_size-1].get('price')
+
+                                    #큰값으로 교체
+                                    #print("이전값 : {}".format(float(tt)))
+                                    #print("비교값 : {}".format(float(ch_price)))
+                                    if float(ch_price) > float(tt):
+                                        tt = ch_price
+
+                                pri_size-=1    
+                                print("!!!!max buy orderd price!!!! {}".format(tt))
+                                
+                        #최대금액+ 기준 호가 금액으로 매도 추가
+                        if float(tt) > 0:
+                            my_cre = get_balance("CRE")
+                            while my_cre > (set_balance/(float(tt)+de_price)):
+                                tt=float(tt)+de_price # 매도할 호가 지정
+                                sell_coin = set_balance/float(tt)
+                                if my_cre > sell_coin:
+                                    upbit.sell_limit_order("KRW-CRE", round(tt,2), sell_coin)
+                                    my_cre = get_balance("CRE")
+                                    print("Order Sell Coin!!!!")
+                                    print("Order Sell Coin!!!! : {}".format(round(tt,2)))
+                                time.sleep(1)
                         
 except Exception as e:
     print(e)
