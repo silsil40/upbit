@@ -31,9 +31,9 @@ TURNOVER_THRESH  = Decimal("3000000000")  # 30억 KRW
 BREAKOUT_HOLD_SEC = 3.0
 
 # 일봉 상태별 파라미터
-BULL_TP1_PCT   = Decimal("0.01")   # +1%
-BULL_TP2_PCT   = Decimal("0.02")   # +2%
-BULL_TRAIL_PCT = Decimal("0.01")   # -1%
+BULL_TP1_PCT   = Decimal("0.007")   # +0.7%
+BULL_TP2_PCT   = Decimal("0.015")   # +1.5%
+BULL_TRAIL_PCT = Decimal("0.009")   # -0.9%
 
 BEAR_TP1_PCT   = Decimal("0.006")  # +0.6%
 BEAR_TP2_PCT   = Decimal("0.01")   # +1%
