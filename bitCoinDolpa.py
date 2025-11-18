@@ -1,52 +1,75 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Upbit KRW-XRP Breakout + Trailing Bot (v2.0, WS 기반)
-- 3분봉 거래대금 >= 30억 AND 양봉(확정 봉)의 종가 돌파가 3초 유지되면 → 시장가 1회 매수(₩400,000)
-- 일봉 상태(양봉/음봉)에 따라 분할익절/트레일링 다르게 적용
-  * 양봉: +1%에 50%, +2%에 추가 25%, 트레일링 -1%에 잔여 25% 손절
-  * 음봉: +0.6%에 50%, +1%에 추가 25%, 트레일링 -0.8%에 잔여 25% 손절
-- 손절 시, 기존 분할 익절 주문이 미체결이면 우선 취소 후 전량 매도
-- WS 재연결/토큰버킷/백오프/주문 UUID 추적 포함
+Upbit KRW-XRP Mixed Scalping + Breakout Bot (실전용 v1)
+
+전략 요약
+[공통]
+- 코인: KRW-XRP
+- 1회 매수금액: 400,000원 (환경변수 BUY_KRW_AMOUNT로 변경 가능)
+- 동시 포지션: 1개만
+
+[스캘핑 모드 (Mean Reversion)]
+- 기준: 1분봉
+- 최근 3분(high/low 기준) 고점 대비 저점 낙폭이 -1.0% 이하
+- 그리고 방금 닫힌 1분봉 종가가 최근 저점 대비 +0.15% 이상 반등일 때
+  → 시장가 40만 원 매수
+- TP: +0.4% (전량)
+- SL: -0.5% (전량)
+- 최대 보유 시간: 120초
+
+[Breakout 모드 (거래대금 급증 예외)]
+- 기준: 1분봉
+- 방금 닫힌 1분봉 거래대금 >= 직전 20개 1분봉 거래대금 평균 * 5
+- 방금 닫힌 1분봉 종가 >= 직전 10개 1분봉 high 최대 * 1.003 (0.3% 돌파)
+  → 시장가 40만 원 매수
+- TP: +0.8%
+- SL: -0.4%
+- 최대 보유 시간: 300초
+
+주의:
+- 실전 전 꼭 모의/소액으로 검증하고 사용하세요.
+- 키는 환경변수 UPBIT_ACCESS_KEY / UPBIT_SECRET_KEY 사용.
 """
 
-import os, time, json, threading, random, uuid
+import os
+import time
+import json
+import threading
+import random
+import uuid
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone, timedelta
 
 import pyupbit
 from pyupbit import WebSocketManager
 
-# ===== 설정 =====
+# ===== 환경 설정 =====
 UPBIT_ACCESS_KEY = os.getenv("UPBIT_ACCESS_KEY", "po04aXLppNilEDtmtkMVGMcL2VaaQTSU4aIy8xLy")
 UPBIT_SECRET_KEY = os.getenv("UPBIT_SECRET_KEY", "6Yi02ssfxbXYzpOFlazpEjinLa6AVq3960lpxEzJ")
 
-SYMBOL           = os.getenv("SYMBOL", "KRW-XRP")
-BUY_KRW_AMOUNT   = Decimal(os.getenv("BUY_KRW_AMOUNT", "400000"))
-
-CANDLE_MINUTES   = 3
-TURNOVER_THRESH  = Decimal("3000000000")  # 30억 KRW
-
-# 3초 유지 진입
-BREAKOUT_HOLD_SEC = 3.0
-
-# 일봉 상태별 파라미터
-BULL_TP1_PCT   = Decimal("0.007")   # +0.7%
-BULL_TP2_PCT   = Decimal("0.015")   # +1.5%
-BULL_TRAIL_PCT = Decimal("0.009")   # -0.9%
-
-BEAR_TP1_PCT   = Decimal("0.006")  # +0.6%
-BEAR_TP2_PCT   = Decimal("0.01")   # +1%
-BEAR_TRAIL_PCT = Decimal("0.008")  # -0.8%
-
-# 일봉 상태 캐시 주기(초)
-DAILY_STATE_TTL = 30.0
-
-# 요청 제한
-REQS_PER_SEC     = 8
-REQS_PER_MIN     = 200
+SYMBOL         = os.getenv("SYMBOL", "KRW-XRP")
+BUY_KRW_AMOUNT = Decimal(os.getenv("BUY_KRW_AMOUNT", "400000"))
 
 RUN_ID = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d-%H%M%S") + f"-{uuid.uuid4().hex[:6]}"
+
+# 스캘핑 파라미터
+SCALP_DROP_PCT    = Decimal("0.01")   # -1.0%
+SCALP_REBOUND_PCT = Decimal("0.0015") # +0.15%
+SCALP_TP_PCT      = Decimal("0.004")  # +0.4%
+SCALP_SL_PCT      = Decimal("0.005")  # -0.5%
+SCALP_MAX_SEC     = 120               # 2분
+
+# Breakout 파라미터
+BRK_VOL_MULT      = Decimal("5")      # 5배 이상 거래대금 폭증
+BRK_LOOKBACK_MIN  = 10                # 10분 high 돌파
+BRK_TP_PCT        = Decimal("0.008")  # +0.8%
+BRK_SL_PCT        = Decimal("0.004")  # -0.4%
+BRK_MAX_SEC       = 300               # 5분
+
+# 요청 제한
+REQS_PER_SEC = 8
+REQS_PER_MIN = 200
 
 def now_kst_dt():
     return datetime.now(timezone.utc).astimezone()
@@ -133,7 +156,6 @@ class UpbitWrap:
         coin = SYMBOL.split("-")[1].upper()
         for b in bals:
             if str(b.get("currency","")).upper() == coin:
-                # Upbit 응답 balance는 '가용(Free)'
                 return Decimal(str(b.get("balance") or "0"))
         return Decimal("0")
 
@@ -145,25 +167,16 @@ class UpbitWrap:
         return self._safe(self.u.sell_market_order, SYMBOL, float(volume),
                           desc=f"sell_market {volume}", soft=True)
 
-    def get_order(self, uuid_: str) -> dict|None:
-        def _ok(r): return isinstance(r, dict) and r.get("state") is not None
-        return self._safe(self.u.get_order, uuid_, desc=f"get_order {uuid_}", validator=_ok, soft=True)
-
-    def cancel_order(self, uuid_: str) -> dict|None:
-        def _ok(r): return isinstance(r, dict) and r.get("uuid")
-        return self._safe(self.u.cancel_order, uuid_, desc=f"cancel_order {uuid_}", validator=_ok, soft=True)
-
 # ===== 메인 봇 =====
-class BreakoutTrailingBot:
+class MixedXrpBot:
     """
-    상태:
-      IDLE  -> (3분봉 확정) 거래대금>=30억 & 양봉이면 watch_close 업데이트
-      WATCH -> 종가 돌파가 3초 '연속 유지'되면 시장가 1회 매수 -> IN_POSITION
-      IN_POSITION:
-          - peak 갱신, trailing_stop 상향
-          - 일봉(양/음)에 따라 TP1/TP2/Trail 기준 분기
-          - 손절 시 TP 주문 취소 후 전량 매도
-          - 전량 매도 완료 시 완전 리셋 -> IDLE
+    - 1분봉 실시간 생성(WS trade 기준)
+    - 캔들 닫힐 때마다:
+        * 스캘핑 진입 여부 체크
+        * Breakout 진입 여부 체크
+    - 포지션 보유 시에는:
+        * 모든 진입 신호 무시
+        * 틱마다 TP/SL/시간초과 체크 후 전량 청산
     """
     def __init__(self):
         self.api = UpbitWrap()
@@ -171,283 +184,243 @@ class BreakoutTrailingBot:
 
         # 실시간
         self.last_price: Decimal|None = None
+
+        # 1분봉 캔들 관리
+        self.cur_candle = None   # dict(open, high, low, close, value, start_ts)
+        self.candles = []        # 최근 N개 1분봉 (파이썬 dict 리스트)
+
+        # 포지션 상태
+        self.position = None     # None or dict{mode, entry, tp, sl, qty, entry_ts}
+
+        # 락
         self.lock = threading.RLock()
 
-        # 3분봉 집계
-        self.cur_candle = None  # dict(open, high, low, close, turnover, start_ts, end_ts)
-
-        # 신호/진입
-        self.watch_target_close: Decimal|None = None
-        self.breakout_hold_since: float | None = None  # 돌파 유지 시작 시각 (epoch)
-
-        # 포지션/트레일링
-        self.in_position = False
-        self.entry_price: Decimal|None = None
-        self.entry_time  = None
-        self.peak_price:  Decimal|None = None
-        self.trailing_stop: Decimal|None = None
-
-        # 분할익절 단계 (0→1→2)
-        self.partial_stage = 0
-        self.tp1_uuid: str|None = None
-        self.tp2_uuid: str|None = None
-
-        # 일봉 상태 캐시
-        self._daily_type = "unknown"
-        self._daily_checked_at = 0.0
-
-    # === 3분 경계/캔들 ===
+    # ===== 캔들 관련 =====
     @staticmethod
     def _bucket_start(ts: datetime) -> datetime:
-        mm = (ts.minute // CANDLE_MINUTES) * CANDLE_MINUTES
-        return ts.replace(second=0, microsecond=0, minute=mm)
+        return ts.replace(second=0, microsecond=0)
 
-    def _roll_candle_if_needed(self, t: datetime):
+    def _on_trade_to_candle(self, price: Decimal, volume: Decimal, t: datetime):
         start = self._bucket_start(t)
-        end = start + timedelta(minutes=CANDLE_MINUTES)
-
         if self.cur_candle is None:
             self.cur_candle = {
-                "open": None, "high": None, "low": None, "close": None,
-                "turnover": Decimal("0"),
-                "start_ts": start, "end_ts": end
+                "start": start,
+                "open": price, "high": price, "low": price, "close": price,
+                "value": price * volume,
             }
             return
 
-        if self.cur_candle["start_ts"] == start:
-            self.cur_candle["end_ts"] = end
-            return
+        # 같은 1분 안이면 업데이트
+        if self.cur_candle["start"] == start:
+            c = self.cur_candle
+            c["close"] = price
+            if price > c["high"]:
+                c["high"] = price
+            if price < c["low"]:
+                c["low"] = price
+            c["value"] += price * volume
+        else:
+            # 이전 캔들 확정
+            closed = self.cur_candle
+            self.candles.append(closed)
+            # 최근 60개까지만 보유(안전빵)
+            if len(self.candles) > 60:
+                self.candles = self.candles[-60:]
 
-        # 캔들 확정
-        self._finalize_candle()
+            logj("candle_close",
+                 start=closed["start"].strftime("%Y-%m-%d %H:%M:%S"),
+                 o=str(closed["open"]), h=str(closed["high"]),
+                 l=str(closed["low"]), c=str(closed["close"]),
+                 value=str(closed["value"]))
 
-        # 새 캔들 시작
-        self.cur_candle = {
-            "open": None, "high": None, "low": None, "close": None,
-            "turnover": Decimal("0"),
-            "start_ts": start, "end_ts": end
-        }
+            # 캔들 확정 시 진입 판단
+            self._on_candle_close(closed)
 
-    def _finalize_candle(self):
-        c = self.cur_candle
-        if not c or c["open"] is None or c["close"] is None:
-            return
+            # 새 캔들 시작
+            self.cur_candle = {
+                "start": start,
+                "open": price, "high": price, "low": price,
+                "close": price, "value": price * volume,
+            }
 
-        logj("candle_close",
-             start=c["start_ts"].strftime("%Y-%m-%d %H:%M:%S"),
-             end=c["end_ts"].strftime("%Y-%m-%d %H:%M:%S"),
-             o=str(c["open"]), h=str(c["high"]), l=str(c["low"]), c=str(c["close"]),
-             turnover=str(c["turnover"]))
+    # ===== 진입 로직 =====
+    def _can_open_new_position(self) -> bool:
+        return self.position is None
 
-        # 조건: 거래대금 >= 30억 AND 양봉(시가 < 종가)
-        if c["turnover"] >= TURNOVER_THRESH and c["open"] < c["close"]:
-            self.watch_target_close = c["close"]
-            # 진입 보류 상태 해제
-            self.breakout_hold_since = None
-            logj("watch_set", close=str(self.watch_target_close),
-                 turnover=str(c["turnover"]), candle=f"{CANDLE_MINUTES}m", bullish=True)
-
-    def _apply_trade_to_candle(self, price: Decimal, volume: Decimal, t: datetime):
-        self._roll_candle_if_needed(t)
-        c = self.cur_candle
-        if c["open"] is None:
-            c["open"] = price
-            c["high"] = price
-            c["low"]  = price
-        c["close"] = price
-        if price > c["high"]: c["high"] = price
-        if price < c["low"]:  c["low"]  = price
-        c["turnover"] += (price * volume)
-
-    # === 일봉 상태 ===
-    def _get_daily_type_cached(self) -> str:
-        now = time.time()
-        if now - self._daily_checked_at < DAILY_STATE_TTL:
-            return self._daily_type
-        try:
-            df = pyupbit.get_ohlcv(SYMBOL, interval="day", count=2)
-            today_open = df.iloc[-1]['open']
-            current = pyupbit.get_current_price(SYMBOL)
-            if current is None or today_open is None:
-                self._daily_type = "unknown"
-            else:
-                self._daily_type = "bull" if current > today_open else "bear"
-        except Exception as e:
-            logj("err_daily_candle", err=str(e))
-            self._daily_type = "unknown"
-        self._daily_checked_at = now
-        return self._daily_type
-
-    # === 유틸/상태 ===
-    def _reset_all(self):
-        self.in_position    = False
-        self.entry_price    = None
-        self.entry_time     = None
-        self.peak_price     = None
-        self.trailing_stop  = None
-        self.watch_target_close = None
-        self.partial_stage  = 0
-        self.tp1_uuid       = None
-        self.tp2_uuid       = None
-        self.breakout_hold_since = None
-        logj("reset_to_idle")
-
-    # === 주문 ===
-    def _ensure_krw(self, need: Decimal) -> bool:
-        krw = self.api.get_balance_krw()
-        if krw < need:
-            logj("krw_short", have=str(krw), need=str(need))
+    def _check_scalping_entry(self) -> bool:
+        # 최근 3개 1분봉이 있어야 함
+        if len(self.candles) < 3:
             return False
-        return True
+        window = self.candles[-3:]
+        recent_high = max(c["high"] for c in window)
+        recent_low  = min(c["low"] for c in window)
+        if recent_high <= 0 or recent_low <= 0:
+            return False
 
-    def _enter_once(self):
-        if self.in_position:
+        drop_pct = (recent_low / recent_high) - Decimal("1")
+        if drop_pct > -SCALP_DROP_PCT:  # -1% 이상 안 빠졌으면 X
+            return False
+
+        # 방금 닫힌 캔들 종가가 recent_low 대비 +0.15% 이상 반등
+        last_close = Decimal(str(self.candles[-1]["close"]))
+        rebound_pct = (last_close / recent_low) - Decimal("1")
+        if rebound_pct >= SCALP_REBOUND_PCT:
+            logj("scalp_signal",
+                 recent_high=str(recent_high),
+                 recent_low=str(recent_low),
+                 drop=str(drop_pct),
+                 rebound=str(rebound_pct),
+                 close=str(last_close))
+            return True
+        return False
+
+    def _check_breakout_entry(self) -> bool:
+        # 최소 20+10개는 있어야 지표 계산
+        if len(self.candles) < 25:
+            return False
+
+        cur = self.candles[-1]
+        cur_close = Decimal(str(cur["close"]))
+        cur_value = Decimal(str(cur["value"]))
+
+        # 거래대금 평균
+        prev_vals = [Decimal(str(c["value"])) for c in self.candles[-21:-1]]  # 직전 20개
+        avg_val = sum(prev_vals) / Decimal(str(len(prev_vals)))
+        if avg_val <= 0:
+            return False
+        if cur_value < avg_val * BRK_VOL_MULT:
+            return False
+
+        # 10분 high 돌파
+        prev_10 = self.candles[-11:-1]
+        recent_high10 = max(c["high"] for c in prev_10)
+        if recent_high10 <= 0:
+            return False
+
+        if cur_close >= recent_high10 * Decimal("1.003"):
+            logj("break_signal",
+                 cur_close=str(cur_close),
+                 cur_value=str(cur_value),
+                 avg_val=str(avg_val),
+                 recent_high10=str(recent_high10))
+            return True
+        return False
+
+    def _enter_position(self, mode: str, price: Decimal):
+        # mode: "scalp" or "break"
+        if not self._can_open_new_position():
             return
-        if not self._ensure_krw(BUY_KRW_AMOUNT):
+
+        krw = self.api.get_balance_krw()
+        if krw < BUY_KRW_AMOUNT:
+            logj("krw_short", have=str(krw), need=str(BUY_KRW_AMOUNT))
             return
+
         r = self.api.buy_market_krw(BUY_KRW_AMOUNT)
-        if not isinstance(r, dict) or not r.get("uuid"):
-            logj("buy_fail", resp=str(r))
+        if not isinstance(r, dict):
+            logj("buy_fail", mode=mode, resp=str(r))
             return
-        # 엔트리/트레일링 초기화
-        self.in_position   = True
-        self.entry_price   = self.last_price
-        self.entry_time    = now_kst_str()
-        self.peak_price    = self.entry_price
-        # trailing은 일봉 타입에 따라 계산
-        dty = self._get_daily_type_cached()
-        trail_pct = (BULL_TRAIL_PCT if dty == "bull" else BEAR_TRAIL_PCT if dty == "bear" else Decimal("0.01"))
-        self.trailing_stop = (self.peak_price * (Decimal("1") - trail_pct)).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
-        self.partial_stage = 0
-        self.tp1_uuid      = None
-        self.tp2_uuid      = None
-        logj("buy_done", uuid=r.get("uuid"), entry=str(self.entry_price),
-             krw=str(BUY_KRW_AMOUNT), trail_stop=str(self.trailing_stop), daily=dty)
 
-    def _place_market_sell(self, ratio: Decimal, tag: str) -> str|None:
+        entry_price = price
+        qty = BUY_KRW_AMOUNT / entry_price
+
+        if mode == "scalp":
+            tp = entry_price * (Decimal("1") + SCALP_TP_PCT)
+            sl = entry_price * (Decimal("1") - SCALP_SL_PCT)
+            max_sec = SCALP_MAX_SEC
+        else:
+            tp = entry_price * (Decimal("1") + BRK_TP_PCT)
+            sl = entry_price * (Decimal("1") - BRK_SL_PCT)
+            max_sec = BRK_MAX_SEC
+
+        self.position = {
+            "mode": mode,
+            "entry": entry_price,
+            "tp": tp,
+            "sl": sl,
+            "qty": qty,
+            "entry_ts": time.time(),
+            "max_sec": max_sec,
+        }
+        logj("enter",
+             mode=mode,
+             entry=str(entry_price),
+             tp=str(tp),
+             sl=str(sl),
+             qty=str(qty),
+             max_sec=max_sec)
+
+    def _on_candle_close(self, closed_candle: dict):
+        # 포지션이 없을 때만 진입 신호 사용
+        if not self._can_open_new_position():
+            return
+
+        # 1) 스캘핑 진입
+        if self._check_scalping_entry():
+            self._enter_position("scalp", Decimal(str(closed_candle["close"])))
+            return
+
+        # 2) Breakout 진입
+        if self._check_breakout_entry():
+            self._enter_position("break", Decimal(str(closed_candle["close"])))
+            return
+
+    # ===== 포지션 관리 (틱마다 TP/SL/시간 체크) =====
+    def _check_position_exit(self, price: Decimal):
+        if self.position is None:
+            return
+        pos = self.position
+        entry = pos["entry"]
+        tp = pos["tp"]
+        sl = pos["sl"]
+        qty = pos["qty"]
+        mode = pos["mode"]
+        max_sec = pos["max_sec"]
+        elapsed = time.time() - pos["entry_ts"]
+
+        reason = None
+        exit_price = price
+
+        if price >= tp:
+            reason = "TP"
+        elif price <= sl:
+            reason = "SL"
+        elif elapsed >= max_sec:
+            reason = "TIME"
+
+        if not reason:
+            return
+
         free = self.api.get_coin_free()
         if free <= 0:
-            return None
-        vol = (free * ratio).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
-        if vol <= 0:
-            return None
-        r = self.api.sell_market(vol)
-        if isinstance(r, dict) and r.get("uuid"):
-            logj(tag, uuid=r.get("uuid"), vol=str(vol))
-            return r.get("uuid")
-        logj(f"{tag}_fail", resp=str(r))
-        return None
-
-    def _cancel_if_open(self, uuid_: str|None, tag: str):
-        if not uuid_:
-            return
-        od = self.api.get_order(uuid_)
-        if not isinstance(od, dict):
-            return
-        state = str(od.get("state","")).lower()
-        if state in ("wait","watch"):
-            cr = self.api.cancel_order(uuid_)
-            if isinstance(cr, dict) and cr.get("uuid"):
-                logj(f"{tag}_cancelled", uuid=uuid_, state=state)
-            else:
-                logj(f"{tag}_cancel_fail", uuid=uuid_, state=state, resp=str(cr))
-
-    def _exit_all(self):
-        # 손절 전에 미체결 TP 주문 정리
-        self._cancel_if_open(self.tp1_uuid, "tp1")
-        self._cancel_if_open(self.tp2_uuid, "tp2")
-        free = self.api.get_coin_free()
-        if free > 0:
-            r = self.api.sell_market(free)
-            if isinstance(r, dict) and r.get("uuid"):
-                logj("sell_all_done", uuid=r.get("uuid"), vol=str(free), exit_price=str(self.last_price))
-            else:
-                logj("sell_all_fail", vol=str(free), resp=str(r))
-        self._reset_all()
-
-    # === 분할익절/트레일링 ===
-    def _update_trailing_and_tp(self, price: Decimal):
-        if not self.in_position or self.entry_price is None:
+            logj("exit_no_free", mode=mode, reason=reason, price=str(price))
+            self.position = None
             return
 
-        # 일봉 타입에 따라 TP/Trail 결정
-        dty = self._get_daily_type_cached()
-        if dty == "bull":
-            tp1 = self.entry_price * (Decimal("1") + BULL_TP1_PCT)  # +1%
-            tp2 = self.entry_price * (Decimal("1") + BULL_TP2_PCT)  # +2%
-            trail_pct = BULL_TRAIL_PCT
-        elif dty == "bear":
-            tp1 = self.entry_price * (Decimal("1") + BEAR_TP1_PCT)  # +0.6%
-            tp2 = self.entry_price * (Decimal("1") + BEAR_TP2_PCT)  # +1%
-            trail_pct = BEAR_TRAIL_PCT
+        # 안전하게: 보유수량과 free 중 최소치 사용
+        sell_qty = min(free, qty)
+        r = self.api.sell_market(sell_qty)
+        pnl = (exit_price - entry) * sell_qty
+
+        if isinstance(r, dict):
+            logj("exit",
+                 mode=mode,
+                 reason=reason,
+                 entry=str(entry),
+                 exit=str(exit_price),
+                 qty=str(sell_qty),
+                 pnl=str(pnl))
         else:
-            tp1 = self.entry_price * Decimal("1.006")
-            tp2 = self.entry_price * Decimal("1.01")
-            trail_pct = Decimal("0.01")
+            logj("exit_fail", mode=mode, reason=reason, resp=str(r))
 
-        # 1차 익절: 전체의 50%
-        if self.partial_stage == 0 and price >= tp1:
-            self.tp1_uuid = self._place_market_sell(Decimal("0.5"), "tp1_sell_50pct")
-            if self.tp1_uuid:
-                self.partial_stage = 1
-                logj("partial_sell_1st", price=str(price), daily=dty)
+        self.position = None
 
-        # 2차 익절: 전체의 25% (잔여 50%의 절반)
-        if self.partial_stage == 1 and price >= tp2:
-            self.tp2_uuid = self._place_market_sell(Decimal("0.5"), "tp2_sell_25pct")
-            if self.tp2_uuid:
-                self.partial_stage = 2
-                logj("partial_sell_2nd", price=str(price), daily=dty)
-
-        # 최고가 갱신 → trailing stop 상향
-        if self.peak_price is None or price > self.peak_price:
-            self.peak_price = price
-            self.trailing_stop = (self.peak_price * (Decimal("1") - trail_pct)).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
-            logj("trail_raise", peak=str(self.peak_price), stop=str(self.trailing_stop), daily=dty)
-
-        # 트레일링 손절(잔여 전량)
-        if self.trailing_stop and price <= self.trailing_stop:
-            logj("trail_hit", price=str(price), stop=str(self.trailing_stop), daily=dty)
-            self._exit_all()
-
-    # === 시세 처리 ===
-    def _on_trade_tick(self, d: dict):
-        price = d.get("trade_price")
-        vol   = d.get("trade_volume")
-        ts    = d.get("timestamp")
-        if price is None or vol is None or ts is None:
-            return
-        price = Decimal(str(price))
-        vol   = Decimal(str(vol))
-        t     = datetime.fromtimestamp(ts/1000, tz=timezone.utc).astimezone()
-
-        with self.lock:
-            self.last_price = price
-            # 3분봉 집계
-            self._apply_trade_to_candle(price, vol, t)
-
-            # (매수 전) 돌파 감시 & 3초 유지 로직
-            if (not self.in_position) and (self.watch_target_close is not None):
-                if price > self.watch_target_close:
-                    if self.breakout_hold_since is None:
-                        self.breakout_hold_since = time.time()
-                    elif (time.time() - self.breakout_hold_since) >= BREAKOUT_HOLD_SEC:
-                        logj("breakout_hit", price=str(price), ref_close=str(self.watch_target_close), hold_sec=BREAKOUT_HOLD_SEC)
-                        self._enter_once()
-                        # 진입 후 감시 리셋
-                        self.breakout_hold_since = None
-                else:
-                    # 돌파 해제되면 타이머 초기화
-                    self.breakout_hold_since = None
-
-            # (매수 후) 분할익절/트레일링
-            self._update_trailing_and_tp(price)
-
-    # === WS 루프 ===
+    # ===== WS 루프 =====
     def _ws_loop(self):
         backoff = 1.0
         while not self._stop:
-            wm = None; last_err = None
+            wm = None
+            last_err = None
             try:
                 wm = WebSocketManager("trade", [SYMBOL])
                 backoff = 1.0
@@ -455,14 +428,32 @@ class BreakoutTrailingBot:
                     raw = wm.get()
                     if not isinstance(raw, dict):
                         continue
-                    self._on_trade_tick(raw)
+                    price = raw.get("trade_price")
+                    volume = raw.get("trade_volume")
+                    ts = raw.get("timestamp")
+                    if price is None or volume is None or ts is None:
+                        continue
+
+                    price_d = Decimal(str(price))
+                    volume_d = Decimal(str(volume))
+                    t = datetime.fromtimestamp(ts/1000, tz=timezone.utc).astimezone()
+
+                    with self.lock:
+                        self.last_price = price_d
+                        # 1분봉 갱신/확정
+                        self._on_trade_to_candle(price_d, volume_d, t)
+                        # 포지션 있으면 TP/SL/시간초과 체크
+                        self._check_position_exit(price_d)
+
             except Exception as e:
                 last_err = e
             finally:
                 try:
-                    if wm is not None: wm.terminate()
+                    if wm is not None:
+                        wm.terminate()
                 except Exception:
                     pass
+
             if self._stop:
                 break
             if last_err:
@@ -472,9 +463,17 @@ class BreakoutTrailingBot:
                 backoff = min(backoff*2, 20.0)
 
     def start(self):
-        logj("start", symbol=SYMBOL, mode="breakout+tp(50%+25%)+trailing",
-             candle=f"{CANDLE_MINUTES}m", turnover=str(TURNOVER_THRESH),
-             breakout_hold=f"{BREAKOUT_HOLD_SEC}s", buy_krw=str(BUY_KRW_AMOUNT))
+        logj("start",
+             symbol=SYMBOL,
+             mode="mixed_scalp+breakout",
+             buy_krw=str(BUY_KRW_AMOUNT),
+             scalp_drop=str(SCALP_DROP_PCT),
+             scalp_tp=str(SCALP_TP_PCT),
+             scalp_sl=str(SCALP_SL_PCT),
+             brk_vol_mult=str(BRK_VOL_MULT),
+             brk_tp=str(BRK_TP_PCT),
+             brk_sl=str(BRK_SL_PCT))
+
         t = threading.Thread(target=self._ws_loop, daemon=True)
         t.start()
         try:
@@ -491,4 +490,4 @@ class BreakoutTrailingBot:
             logj("stop")
 
 if __name__ == "__main__":
-    BreakoutTrailingBot().start()
+    MixedXrpBot().start()
