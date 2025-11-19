@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Upbit KRW-XRP Breakout Bot (No-Trailing, No-Partial, Fixed TP/SL)
+Upbit KRW-XRP Breakout Bot (전량매수/전량매도 + 재진입 금지 버전)
 
-전략 요약:
-- 3분봉 거래대금 >= 30억 & 양봉 → 해당 봉 종가 기록
-- 실시간 가격이 종가를 '3초 연속 초과'하면 시장가 진입(400,000원)
-- TP = +0.6% (전량)
-- SL = -0.8% (전량)
-- 부분매도 없음, 트레일링 없음
-- 청산 후 즉시 IDLE로 복귀
+전략 요약
+- 3분봉 기준
+- 거래대금 >= 30억 AND 양봉이면 → watch_close 세팅
+- 이후 실시간 가격이 종가 돌파 후 3초 유지되면 매수(40만 원)
+- TP +0.6% / SL -0.8%
+- 부분매도/트레일링 없음 (전량 매도)
+- 매도한 그 3분봉에서는 재진입 절대 금지
 """
 
 import os, time, json, threading, random, uuid
@@ -27,18 +27,16 @@ SYMBOL           = os.getenv("SYMBOL", "KRW-XRP")
 BUY_KRW_AMOUNT   = Decimal(os.getenv("BUY_KRW_AMOUNT", "400000"))
 
 CANDLE_MINUTES   = 3
-TURNOVER_THRESH  = Decimal("3000000000")  # 30억 KRW
-
-# 돌파 유지 조건
+TURNOVER_THRESH  = Decimal("3000000000")  # 30억
 BREAKOUT_HOLD_SEC = 3.0
 
-# TP / SL (고정)
+# 고정 TP/SL
 TP_PCT = Decimal("0.006")   # +0.6%
 SL_PCT = Decimal("0.008")   # -0.8%
 
 # 요청 제한
-REQS_PER_SEC     = 8
-REQS_PER_MIN     = 200
+REQS_PER_SEC = 8
+REQS_PER_MIN = 200
 
 RUN_ID = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d-%H%M%S") + f"-{uuid.uuid4().hex[:6]}"
 
@@ -53,10 +51,9 @@ def logj(event: str, **fields):
     rec.update(fields)
     print(json.dumps(rec, ensure_ascii=False), flush=True)
 
-
 # ===== 토큰버킷 =====
 class TokenBucket:
-    def __init__(self, per_sec:int, per_min:int):
+    def __init__(self, per_sec, per_min):
         self.per_sec = per_sec
         self.per_min = per_min
         self.lock = threading.Lock()
@@ -86,30 +83,29 @@ class TokenBucket:
                     return
             time.sleep(0.02)
 
-
-# ===== Upbit API 래퍼 =====
+# ===== Upbit 래퍼 =====
 class UpbitWrap:
     def __init__(self):
         if not UPBIT_ACCESS_KEY or not UPBIT_SECRET_KEY:
-            raise SystemExit("UPBIT 키(UPBIT_ACCESS_KEY/UPBIT_SECRET_KEY)가 비어 있음")
+            raise SystemExit("UPBIT 키 없음")
         self.u = pyupbit.Upbit(UPBIT_ACCESS_KEY, UPBIT_SECRET_KEY)
         self.tb = TokenBucket(REQS_PER_SEC, REQS_PER_MIN)
         self.MAX_RETRY = 5
         self.BACKOFF_MAX = 20.0
 
-    def _safe(self, fn, *args, desc="", validator=None, soft=False, **kwargs):
+    def _safe(self, fn, *args, soft=False, desc="", validator=None, **kwargs):
         delay = 1.0
         for attempt in range(1, self.MAX_RETRY+1):
             self.tb.acquire()
             try:
                 r = fn(*args, **kwargs)
                 if validator and not validator(r):
-                    raise RuntimeError(f"Invalid response: {desc or fn.__name__}")
+                    raise RuntimeError("Invalid")
                 return r
             except Exception as e:
                 logj("api_err", where=desc or fn.__name__, attempt=attempt, err=str(e))
                 if attempt < self.MAX_RETRY:
-                    time.sleep(min(delay, self.BACKOFF_MAX) * random.uniform(0.8, 1.2))
+                    time.sleep(min(delay, self.BACKOFF_MAX)*random.uniform(0.8,1.2))
                     delay = min(delay*2, self.BACKOFF_MAX)
                     continue
                 if soft:
@@ -117,59 +113,56 @@ class UpbitWrap:
                 raise
 
     def get_balance_krw(self):
-        def _ok(v):
-            try: Decimal(str(v)); return True
+        def _ok(x):
+            try: Decimal(str(x)); return True
             except: return False
-        r = self._safe(self.u.get_balance, "KRW", desc="get_balance(KRW)", validator=_ok, soft=True)
-        return Decimal(str(r or "0"))
+        b = self._safe(self.u.get_balance, "KRW", soft=True, desc="get_balance", validator=_ok)
+        return Decimal(str(b or "0"))
 
     def get_coin_free(self):
-        bals = self._safe(self.u.get_balances, desc="get_balances", soft=True) or []
+        bals = self._safe(self.u.get_balances, soft=True) or []
         coin = SYMBOL.split("-")[1].upper()
         for b in bals:
             if b.get("currency","").upper() == coin:
                 return Decimal(str(b.get("balance") or "0"))
         return Decimal("0")
 
-    def buy_market_krw(self, krw: Decimal):
-        return self._safe(self.u.buy_market_order, SYMBOL, float(krw), desc="buy_market", soft=True)
+    def buy_market(self, krw):
+        return self._safe(self.u.buy_market_order, SYMBOL, float(krw), soft=True, desc="buy_market")
 
-    def sell_market(self, volume: Decimal):
-        return self._safe(self.u.sell_market_order, SYMBOL, float(volume), desc="sell_market", soft=True)
+    def sell_market(self, vol):
+        return self._safe(self.u.sell_market_order, SYMBOL, float(vol), soft=True, desc="sell_market")
 
-
-# ===== 메인 전략 =====
-class BreakoutSimpleBot:
+# ===== 메인봇 =====
+class BreakoutBot:
     """
-    매우 단순화된 Breakout Bot:
-    - watch_target_close 돌파 3초 유지 → 전량 매수
-    - TP / SL 도달 → 전량 매도
+    재진입 금지 버전
+    - 매도한 그 3분봉에서는 재진입 금지
     """
-
     def __init__(self):
         self.api = UpbitWrap()
         self._stop = False
-
-        self.last_price = None
         self.lock = threading.RLock()
 
-        # 캔들 데이터
         self.cur_candle = None
+        self.last_price = None
+
+        # 진입 트리거
         self.watch_target_close = None
         self.breakout_hold_since = None
 
-        # 포지션
+        # 포지션 상태
         self.in_position = False
         self.entry_price = None
-        self.entry_time = None
-
-        # TP/SL
         self.tp = None
         self.sl = None
 
-    # === 3분 캔들 관리 ===
+        # 재진입 금지 (해당 봉 start_ts)
+        self.no_entry_until = None
+
+    # ===== 3분봉 처리 =====
     @staticmethod
-    def _bucket_start(ts: datetime):
+    def _bucket_start(ts):
         mm = (ts.minute // CANDLE_MINUTES) * CANDLE_MINUTES
         return ts.replace(second=0, microsecond=0, minute=mm)
 
@@ -179,165 +172,187 @@ class BreakoutSimpleBot:
 
         if self.cur_candle is None:
             self.cur_candle = {
+                "start": start, "end": end,
                 "open": None, "high": None, "low": None, "close": None,
-                "turnover": Decimal("0"),
-                "start_ts": start, "end_ts": end,
+                "turnover": Decimal("0")
             }
             return
 
-        if self.cur_candle["start_ts"] == start:
-            self.cur_candle["end_ts"] = end
+        if self.cur_candle["start"] == start:
+            self.cur_candle["end"] = end
             return
 
-        # 캔들 확정
+        # 구봉 마감
         self._finalize_candle()
 
-        # 새 캔들 시작
+        # 새 봉
         self.cur_candle = {
+            "start": start, "end": end,
             "open": None, "high": None, "low": None, "close": None,
-            "turnover": Decimal("0"),
-            "start_ts": start, "end_ts": end,
+            "turnover": Decimal("0")
         }
 
-    def _finalize_candle(self):
-        c = self.cur_candle
-        if not c or c["open"] is None:
-            return
-
-        logj("candle_close",
-             start=c["start_ts"].strftime("%Y-%m-%d %H:%M:%S"),
-             end=c["end_ts"].strftime("%Y-%m-%d %H:%M:%S"),
-             o=str(c["open"]), h=str(c["high"]), l=str(c["low"]),
-             c=str(c["close"]), turnover=str(c["turnover"]))
-
-        # 30억 + 양봉
-        if c["turnover"] >= TURNOVER_THRESH and c["open"] < c["close"]:
-            self.watch_target_close = c["close"]
-            self.breakout_hold_since = None
-            logj("watch_set",
-                 close=str(self.watch_target_close),
-                 turnover=str(c["turnover"]))
-
-    def _apply_trade(self, price: Decimal, volume: Decimal, t: datetime):
+    def _apply_trade(self, price, vol, t):
         self._roll_candle_if_needed(t)
         c = self.cur_candle
         if c["open"] is None:
-            c["open"] = price
-            c["high"] = price
-            c["low"]  = price
+            c["open"] = c["high"] = c["low"] = price
         c["close"] = price
         if price > c["high"]: c["high"] = price
         if price < c["low"]:  c["low"]  = price
-        c["turnover"] += (price * volume)
+        c["turnover"] += (price * vol)
 
-    # === 포지션 관리 ===
+    def _finalize_candle(self):
+        c = self.cur_candle
+        if c["open"] is None:
+            return
+
+        logj("candle_close",
+             start=c["start"].strftime("%Y-%m-%d %H:%M:%S"),
+             o=str(c["open"]), h=str(c["high"]),
+             l=str(c["low"]), c=str(c["close"]),
+             turnover=str(c["turnover"]))
+
+        # 재진입 금지 봉이면 skip
+        if self.no_entry_until == c["start"]:
+            logj("skip_reentry_candle", start=c["start"].strftime("%H:%M"))
+            return
+
+        # 조건 만족할 때 watch 세팅
+        if c["turnover"] >= TURNOVER_THRESH and c["open"] < c["close"]:
+            self.watch_target_close = c["close"]
+            self.breakout_hold_since = None
+            logj("watch_set", close=str(c["close"]), turnover=str(c["turnover"]))
+
+    # ===== 진입 =====
     def _enter(self):
         if self.in_position:
             return
+        if not self.watch_target_close:
+            return
+
         krw = self.api.get_balance_krw()
         if krw < BUY_KRW_AMOUNT:
             logj("krw_short", have=str(krw))
             return
 
-        r = self.api.buy_market_krw(BUY_KRW_AMOUNT)
-        if not isinstance(r, dict) or not r.get("uuid"):
+        r = self.api.buy_market(BUY_KRW_AMOUNT)
+        if not r or not r.get("uuid"):
             logj("buy_fail", resp=str(r))
             return
 
         self.in_position = True
         self.entry_price = self.last_price
-        self.entry_time  = now_kst_str()
 
-        # 전량 TP / SL
-        self.tp = self.entry_price * (Decimal("1") + TP_PCT)
-        self.sl = self.entry_price * (Decimal("1") - SL_PCT)
+        self.tp = (self.entry_price * (Decimal("1") + TP_PCT)).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+        self.sl = (self.entry_price * (Decimal("1") - SL_PCT)).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
 
         logj("buy_done",
              entry=str(self.entry_price),
              tp=str(self.tp),
-             sl=str(self.sl),
-             uuid=r.get("uuid"))
+             sl=str(self.sl))
 
-    def _exit(self, reason, price):
+    # ===== 청산 =====
+    def _exit_all(self):
         free = self.api.get_coin_free()
         if free > 0:
             r = self.api.sell_market(free)
-            logj("sell_all", reason=reason, price=str(price),
-                 vol=str(free), resp=str(r))
-        self._reset()
-
-    def _reset(self):
+            if r and r.get("uuid"):
+                logj("sell_all", vol=str(free), price=str(self.last_price))
         self.in_position = False
         self.entry_price = None
         self.tp = None
         self.sl = None
+
+        # 재진입 금지 설정
+        if self.cur_candle:
+            self.no_entry_until = self.cur_candle["start"]
+            logj("no_reentry_set", until=self.no_entry_until.strftime("%H:%M"))
+
         self.watch_target_close = None
         self.breakout_hold_since = None
-        logj("reset")
 
-    # === WS Tick Handling ===
-    def _on_tick(self, raw):
-        price = raw.get("trade_price")
-        vol   = raw.get("trade_volume")
-        ts    = raw.get("timestamp")
-        if price is None:
+    # ===== 틱 처리 =====
+    def _on_tick(self, d):
+        price = d.get("trade_price")
+        vol = d.get("trade_volume")
+        ts  = d.get("timestamp")
+        if price is None or vol is None or ts is None:
             return
 
         price = Decimal(str(price))
-        vol = Decimal(str(vol or 0))
-        t = datetime.fromtimestamp(ts/1000, tz=timezone.utc).astimezone()
+        vol   = Decimal(str(vol))
+        t     = datetime.fromtimestamp(ts/1000, tz=timezone.utc).astimezone()
 
         with self.lock:
             self.last_price = price
             self._apply_trade(price, vol, t)
 
-            # --- 매수 전 ---
-            if not self.in_position and self.watch_target_close is not None:
+            # 진입 대기 상태
+            if not self.in_position and self.watch_target_close:
                 if price > self.watch_target_close:
                     if self.breakout_hold_since is None:
                         self.breakout_hold_since = time.time()
-                    elif time.time() - self.breakout_hold_since >= BREAKOUT_HOLD_SEC:
+                    elif (time.time() - self.breakout_hold_since) >= BREAKOUT_HOLD_SEC:
                         logj("breakout_hit", price=str(price))
                         self._enter()
                         self.breakout_hold_since = None
                 else:
                     self.breakout_hold_since = None
 
-            # --- 매수 후 TP/SL ---
+            # 포지션 보유 중 TP/SL
             if self.in_position:
                 if price >= self.tp:
-                    self._exit("TP", price)
+                    logj("tp_hit", price=str(price))
+                    self._exit_all()
                 elif price <= self.sl:
-                    self._exit("SL", price)
+                    logj("sl_hit", price=str(price))
+                    self._exit_all()
 
-    # === WS 루프 ===
+    # ===== WS loop =====
     def _ws_loop(self):
         backoff = 1.0
         while not self._stop:
             wm = None
+            err = None
             try:
                 wm = WebSocketManager("trade", [SYMBOL])
+                backoff = 1.0
                 while not self._stop:
-                    self._on_tick(wm.get())
+                    raw = wm.get()
+                    if isinstance(raw, dict):
+                        self._on_tick(raw)
             except Exception as e:
-                logj("ws_err", err=str(e))
+                err = e
             finally:
-                if wm: 
-                    try: wm.terminate()
-                    except: pass
-            time.sleep(1)
+                try:
+                    if wm: wm.terminate()
+                except:
+                    pass
+
+            if self._stop:
+                break
+
+            if err:
+                wait = min(backoff, 20.0)*random.uniform(0.8,1.2)
+                logj("ws_error", err=str(err), reconnect_in=wait)
+                time.sleep(wait)
+                backoff = min(backoff*2, 20.0)
 
     def start(self):
-        logj("start", symbol=SYMBOL, tp=str(TP_PCT), sl=str(SL_PCT))
+        logj("start", symbol=SYMBOL, mode="breakout_full", buy_krw=str(BUY_KRW_AMOUNT))
         t = threading.Thread(target=self._ws_loop, daemon=True)
         t.start()
         try:
             while True:
-                time.sleep(1)
+                time.sleep(0.3)
         except KeyboardInterrupt:
+            pass
+        finally:
             self._stop = True
-        logj("stop")
+            t.join(timeout=2.0)
+            logj("stop")
 
 
 if __name__ == "__main__":
-    BreakoutSimpleBot().start()
+    BreakoutBot().start()
