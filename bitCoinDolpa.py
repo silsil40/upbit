@@ -31,8 +31,8 @@ import pandas as pd
 # ==========================================
 # [사용자 설정]
 # ==========================================
-UPBIT_ACCESS_KEY = os.getenv("UPBIT_ACCESS_KEY", "여기에_엑세스키")
-UPBIT_SECRET_KEY = os.getenv("UPBIT_SECRET_KEY", "여기에_시크릿키")
+UPBIT_ACCESS_KEY = os.getenv("UPBIT_ACCESS_KEY", "po04aXLppNilEDtmtkMVGMcL2VaaQTSU4aIy8xLy")
+UPBIT_SECRET_KEY = os.getenv("UPBIT_SECRET_KEY", "6Yi02ssfxbXYzpOFlazpEjinLa6AVq3960lpxEzJ")
 
 SYMBOL           = "KRW-XRP"
 BUY_KRW_AMOUNT   = Decimal("400000")
