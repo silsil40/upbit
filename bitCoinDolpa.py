@@ -28,12 +28,16 @@ import json
 import threading
 import uuid
 import math
-from decimal import Decimal
-from datetime import datetime, timezone, timedelta
+import traceback  # [적용됨] 에러 위치 추적 모듈
+from decimal import Decimal, getcontext
+from datetime import datetime, timezone
 
 import pyupbit
 from pyupbit import WebSocketManager
 import pandas as pd
+
+# Decimal 정밀도 설정
+getcontext().prec = 28
 
 # ==========================================
 # [사용자 설정 영역]
@@ -41,25 +45,20 @@ import pandas as pd
 UPBIT_ACCESS_KEY = os.getenv("UPBIT_ACCESS_KEY", "po04aXLppNilEDtmtkMVGMcL2VaaQTSU4aIy8xLy")
 UPBIT_SECRET_KEY = os.getenv("UPBIT_SECRET_KEY", "6Yi02ssfxbXYzpOFlazpEjinLa6AVq3960lpxEzJ")
 
-# [설정] 종목: 솔라나
 SYMBOL             = "KRW-SOL" 
-BUY_KRW_AMOUNT     = Decimal("400000")     # 1회 매수 금액 (40만 원)
-
-# [설정] 거래대금 기준: 10억 원
+BUY_KRW_AMOUNT     = Decimal("400000")
 TURNOVER_THRESH    = Decimal("1000000000") 
 
-# 지표 설정
+# 지표 상수 (Decimal)
 RSI_PERIOD         = 9
-RSI_LIMIT          = 75.0 # [전략 A] 돌파 시 RSI가 이 값보다 낮아야 함
-RSI_REBOUND_LIMIT  = 25.0 # [전략 B] 반등 시 RSI가 이 값보다 낮아야 함
+RSI_LIMIT          = Decimal("75.0") 
+RSI_REBOUND_LIMIT  = Decimal("25.0") 
 MA_PERIOD          = 20
 
-# 진입 및 청산 설정
-BREAKOUT_HOLD_SEC  = 1.0              # [전략 A] 돌파 시 1초간 가격 유지해야 진입
-TP_PCT             = Decimal("0.007") # 익절 목표: +0.7%
-SL_PCT             = Decimal("0.007") # 손절 기준: -0.7%
+BREAKOUT_HOLD_SEC  = 1.0              
+TP_PCT             = Decimal("0.007") 
+SL_PCT             = Decimal("0.007") 
 
-# API 호출 제한 (업비트 정책 준수)
 REQS_PER_SEC       = 8
 REQS_PER_MIN       = 200
 # ==========================================
@@ -69,31 +68,42 @@ RUN_ID = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d-%H%M%S") + f"-
 def now_kst_str():
     return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
-# [수정 1] Decimal 타입을 JSON으로 변환하기 위한 인코더 클래스 추가
 class DecimalEncoder(json.JSONEncoder):
     def default(self, obj):
-        if isinstance(obj, Decimal):
-            return str(obj)  # Decimal을 문자열로 변환
-        return super(DecimalEncoder, self).default(obj)
+        try:
+            if isinstance(obj, Decimal):
+                return str(obj)
+            return super(DecimalEncoder, self).default(obj)
+        except:
+            return str(obj)
 
-# [수정 2] logj 함수에서 DecimalEncoder 사용하도록 변경
 def logj(event: str, **fields):
-    rec = {"ts": now_kst_str(), "run": RUN_ID, "ev": event}
-    rec.update(fields)
-    # cls=DecimalEncoder 옵션 추가
-    print(json.dumps(rec, ensure_ascii=False, cls=DecimalEncoder), flush=True)
+    try:
+        rec = {"ts": now_kst_str(), "run": RUN_ID, "ev": event}
+        rec.update(fields)
+        print(json.dumps(rec, ensure_ascii=False, cls=DecimalEncoder), flush=True)
+    except Exception as e:
+        # 로그 에러가 나도 매매 로직은 계속 돌아가도록 print로 대체
+        print(f"[LOG_ERROR_BYPASS] event={event} error={str(e)}", flush=True)
 
+# [수정됨] 사용자 요청 호가 단위 적용 (10만->100원, 50만->500원)
 def adjust_price_to_tick(price):
-    if price >= 2000000: tick = 1000
-    elif price >= 1000000: tick = 500
-    elif price >= 500000:  tick = 100
-    elif price >= 100000:  tick = 50
-    elif price >= 10000:   tick = 10
-    elif price >= 1000:    tick = 1
-    elif price >= 100:     tick = 0.1
-    elif price >= 10:      tick = 0.01
-    else: tick = 0.0001
-    return math.floor(price / tick) * tick
+    try:
+        p = Decimal(str(price))
+        
+        if p >= 2000000:   tick = Decimal("1000")
+        elif p >= 500000:  tick = Decimal("500")  # [수정] 50만원 이상 -> 500원
+        elif p >= 100000:  tick = Decimal("100")  # [수정] 10만원 이상 -> 100원
+        elif p >= 10000:   tick = Decimal("10")
+        elif p >= 1000:    tick = Decimal("1")
+        elif p >= 100:     tick = Decimal("0.1")
+        elif p >= 10:      tick = Decimal("0.01")
+        else: tick = Decimal("0.0001")
+        
+        floor_val = (p / tick).to_integral_value(rounding='ROUND_FLOOR')
+        return floor_val * tick
+    except Exception:
+        return Decimal(str(price))
 
 class TokenBucket:
     def __init__(self, per_sec, per_min):
@@ -164,8 +174,10 @@ def calc_indicators(df):
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).fillna(0)
     loss = (-delta.where(delta < 0, 0)).fillna(0)
+    
     avg_gain = gain.rolling(window=RSI_PERIOD, min_periods=1).mean()
     avg_loss = loss.rolling(window=RSI_PERIOD, min_periods=1).mean()
+    
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
     ma20 = close.rolling(window=MA_PERIOD).mean()
@@ -177,7 +189,6 @@ class BreakoutBot:
         self.api = UpbitWrap()
         self.lock = threading.RLock()
         
-        # [상태 변수들]
         self.cur_candle = None
         self.in_pos = False         
         self.entry_price = None     
@@ -185,11 +196,8 @@ class BreakoutBot:
         self.tp_uuid = None         
         self.tp_check_ts = 0
         
-        # [전략 A 변수]
         self.watch_target_b = None  
         self.hold_start_b = None    
-        
-        # [전략 B 변수]
         self.watch_target_r = None   
         self.is_rebound_ready = False 
 
@@ -210,13 +218,12 @@ class BreakoutBot:
                 }], index=[c['start']])
                 df = pd.concat([df, new_row])
 
-            rsi_series, ma20, prev_close, prev_volume = calc_indicators(df)
-            if rsi_series is None: return # 데이터 부족 시 리턴
-            current_rsi = rsi_series.iloc[-1] 
+            rsi_series, ma20_val, prev_close, prev_volume = calc_indicators(df)
+            if rsi_series is None: return 
+            
+            current_rsi = Decimal(str(rsi_series.iloc[-1]))
+            ma20 = Decimal(str(ma20_val))
 
-            # ----------------------------------------------------
-            # 1. [전략 B] 낙폭 반등
-            # ----------------------------------------------------
             with self.lock:
                 if self.is_rebound_ready:
                       logj("rebound_expired", reason="Candle Closed (Missed)")
@@ -225,7 +232,6 @@ class BreakoutBot:
 
             if len(df) >= 3:
                 recent_3 = df.iloc[-3:] 
-                
                 closes = recent_3['close'].values
                 opens = recent_3['open'].values
                 is_three_crows = all(closes < opens)
@@ -236,10 +242,9 @@ class BreakoutBot:
                 if is_three_crows and is_oversold and is_vol_spike:
                     with self.lock:
                         self.is_rebound_ready = True
-                        
                         body_len = c['o'] - c['c']
                         target_raw = c['c'] + (body_len * Decimal("0.33"))
-                        self.watch_target_r = adjust_price_to_tick(float(target_raw))
+                        self.watch_target_r = adjust_price_to_tick(target_raw)
                         
                         logj("rebound_watch_on", 
                              status="New Pattern Found",
@@ -248,9 +253,7 @@ class BreakoutBot:
                              rsi=f"{current_rsi:.1f}",
                              vol_krw=f"{int(c['vol']):,}")
 
-            # ----------------------------------------------------
-            # 2. [전략 A] 돌파 매매
-            # ----------------------------------------------------
+            # [전략 A] 돌파 매매
             if c['vol'] >= TURNOVER_THRESH and c['o'] < c['c']: 
                 is_valid_breakout = (current_rsi < RSI_LIMIT) and (c['c'] >= ma20)
                 with self.lock:
@@ -261,45 +264,52 @@ class BreakoutBot:
                     else:
                         self.watch_target_b = None
 
-        except Exception as e:
-            logj("err_analyze", msg=str(e))
+        except Exception:
+            # [적용됨] 에러 발생 시 Traceback(상세 라인) 로그 출력
+            logj("err_analyze", trace=traceback.format_exc())
 
     def _enter(self, price, strategy_name):
-        if self.in_pos: return
-        krw = self.api.get_balance_krw()
-        if krw < BUY_KRW_AMOUNT: return
+        try:
+            if self.in_pos: return
+            krw = self.api.get_balance_krw()
+            if krw < BUY_KRW_AMOUNT: return
 
-        # [수정] logj가 Decimal을 처리해주므로 바로 넘겨도 됨
-        logj("buy_try", price=price, strat=strategy_name)
-        
-        r = self.api.buy_market(BUY_KRW_AMOUNT)
-        
-        if r and r.get('uuid'):
-            self.in_pos = True
-            self.entry_price = Decimal(str(price))
+            logj("buy_try", price=price, strat=strategy_name)
             
-            target_price = adjust_price_to_tick(float(self.entry_price) * (1 + float(TP_PCT)))
-            self.sl_price = self.entry_price * (Decimal("1") - SL_PCT)
+            r = self.api.buy_market(BUY_KRW_AMOUNT)
+            
+            if r and r.get('uuid'):
+                self.in_pos = True
+                self.entry_price = Decimal(str(price))
+                
+                target_raw = self.entry_price * (Decimal("1") + TP_PCT)
+                target_price = adjust_price_to_tick(target_raw)
+                
+                self.sl_price = self.entry_price * (Decimal("1") - SL_PCT)
 
-            vol = Decimal("0")
-            for _ in range(10):
-                time.sleep(0.1) 
-                vol = self.api.get_coin_free()
-                if vol > 0: break
+                vol = Decimal("0")
+                for _ in range(30): 
+                    time.sleep(0.1) 
+                    vol = self.api.get_coin_free()
+                    if vol > 0: break
+                
+                if vol > 0:
+                    ord_res = self.api.sell_limit(target_price, vol)
+                    if ord_res and ord_res.get('uuid'):
+                        self.tp_uuid = ord_res['uuid']
+                        logj("tp_placed", price=target_price, sl_trigger=self.sl_price)
+                else:
+                    logj("err", msg="Buy success but No Balance?")
             
-            if vol > 0:
-                ord_res = self.api.sell_limit(target_price, vol)
-                if ord_res and ord_res.get('uuid'):
-                    self.tp_uuid = ord_res['uuid']
-                    logj("tp_placed", price=target_price, sl_trigger=self.sl_price)
-            else:
-                logj("err", msg="Buy success but No Balance?")
-        
-        with self.lock:
-            self.watch_target_b = None
-            self.hold_start_b = None
-            self.watch_target_r = None
-            self.is_rebound_ready = False
+            with self.lock:
+                self.watch_target_b = None
+                self.hold_start_b = None
+                self.watch_target_r = None
+                self.is_rebound_ready = False
+
+        except Exception:
+            # [적용됨] 에러 발생 시 Traceback(상세 라인) 로그 출력
+            logj("err_enter_crit", trace=traceback.format_exc())
 
     def _sl(self, price):
         logj("sl_trigger", price=price)
@@ -323,7 +333,6 @@ class BreakoutBot:
         logj("reset", msg=reason)
 
     def _on_tick(self, d):
-        # [수정 3] Tick 처리 중 에러가 나도 봇이 죽지 않도록 보호
         try:
             if 'trade_price' not in d: return
             p = Decimal(str(d['trade_price']))
@@ -343,7 +352,6 @@ class BreakoutBot:
             self.cur_candle['vol'] += (p*v)
 
             with self.lock:
-                # 1. 포지션 관리
                 if self.in_pos:
                     if self.sl_price and p <= self.sl_price:
                         self._sl(p)
@@ -355,8 +363,6 @@ class BreakoutBot:
                             self.tp_check_ts = time.time()
                     return
 
-                # 2. 진입 감시
-                # [전략 A] 돌파
                 if self.watch_target_b:
                     if p > self.watch_target_b:
                         if self.hold_start_b is None: self.hold_start_b = time.time()
@@ -367,21 +373,20 @@ class BreakoutBot:
                     else:
                         self.hold_start_b = None
                 
-                # [전략 B] 반등
                 if self.is_rebound_ready and self.watch_target_r:
                     if (p >= self.watch_target_r) and (p >= self.cur_candle['o']):
                         logj("rebound_hit_B", price=p)
                         self._enter(p, "REBOUND_B")
                         return
 
-        except Exception as e:
-            # 에러 발생 시 로그만 남기고 봇은 계속 수행
-            logj("err_tick", msg=str(e))
+        except Exception:
+            # [적용됨] 틱 처리 중 에러 발생 시 Traceback 출력
+            logj("err_tick", trace=traceback.format_exc())
 
     def start(self):
         logj("start", 
              setting=f"Coin:{SYMBOL}, Vol:>10억, TP:{TP_PCT}, Rebound:33%", 
-             msg="Bot Started with Fixed JSON & SafeGuard")
+             msg="Bot Started with TRACEBACK & CUSTOM TICK")
         
         while True:
             try:
