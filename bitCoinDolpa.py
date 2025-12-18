@@ -28,7 +28,7 @@ import json
 import threading
 import uuid
 import math
-import traceback  # [적용됨] 에러 위치 추적 모듈
+import traceback
 from decimal import Decimal, getcontext
 from datetime import datetime, timezone
 
@@ -36,7 +36,6 @@ import pyupbit
 from pyupbit import WebSocketManager
 import pandas as pd
 
-# Decimal 정밀도 설정
 getcontext().prec = 28
 
 # ==========================================
@@ -49,7 +48,7 @@ SYMBOL             = "KRW-SOL"
 BUY_KRW_AMOUNT     = Decimal("400000")
 TURNOVER_THRESH    = Decimal("1000000000") 
 
-# 지표 상수 (Decimal)
+# 지표 설정
 RSI_PERIOD         = 9
 RSI_LIMIT          = Decimal("75.0") 
 RSI_REBOUND_LIMIT  = Decimal("25.0") 
@@ -83,23 +82,19 @@ def logj(event: str, **fields):
         rec.update(fields)
         print(json.dumps(rec, ensure_ascii=False, cls=DecimalEncoder), flush=True)
     except Exception as e:
-        # 로그 에러가 나도 매매 로직은 계속 돌아가도록 print로 대체
         print(f"[LOG_ERROR_BYPASS] event={event} error={str(e)}", flush=True)
 
-# [수정됨] 사용자 요청 호가 단위 적용 (10만->100원, 50만->500원)
 def adjust_price_to_tick(price):
     try:
         p = Decimal(str(price))
-        
         if p >= 2000000:   tick = Decimal("1000")
-        elif p >= 500000:  tick = Decimal("500")  # [수정] 50만원 이상 -> 500원
-        elif p >= 100000:  tick = Decimal("100")  # [수정] 10만원 이상 -> 100원
+        elif p >= 500000:  tick = Decimal("500")  
+        elif p >= 100000:  tick = Decimal("100") 
         elif p >= 10000:   tick = Decimal("10")
         elif p >= 1000:    tick = Decimal("1")
         elif p >= 100:     tick = Decimal("0.1")
         elif p >= 10:      tick = Decimal("0.01")
         else: tick = Decimal("0.0001")
-        
         floor_val = (p / tick).to_integral_value(rounding='ROUND_FLOOR')
         return floor_val * tick
     except Exception:
@@ -168,18 +163,24 @@ class UpbitWrap:
     def cancel_order(self, uuid):
         return self._safe(self.u.cancel_order, uuid)
 
+# [수정됨] RSI 계산을 업비트와 동일한 ewm(Wilder's Smoothing) 방식으로 변경
 def calc_indicators(df):
     if df is None or len(df) < 30: return None, None, None, None
     close = df['close']
     delta = close.diff()
-    gain = (delta.where(delta > 0, 0)).fillna(0)
-    loss = (-delta.where(delta < 0, 0)).fillna(0)
     
-    avg_gain = gain.rolling(window=RSI_PERIOD, min_periods=1).mean()
-    avg_loss = loss.rolling(window=RSI_PERIOD, min_periods=1).mean()
+    # gain/loss 분리
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    
+    # Wilder's Smoothing (alpha=1/N)
+    avg_gain = gain.ewm(alpha=1/RSI_PERIOD, min_periods=RSI_PERIOD, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/RSI_PERIOD, min_periods=RSI_PERIOD, adjust=False).mean()
     
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.fillna(100) # 0 나누기 방지
+
     ma20 = close.rolling(window=MA_PERIOD).mean()
     
     return rsi, ma20.iloc[-1], df['close'].iloc[-2], df['volume'].iloc[-2]
@@ -200,6 +201,7 @@ class BreakoutBot:
         self.hold_start_b = None    
         self.watch_target_r = None   
         self.is_rebound_ready = False 
+        self.last_alive_ts = time.time()
 
     def _finalize_candle(self, c):
         threading.Thread(target=self._analyze_and_manage_strategy, args=(c,), daemon=True).start()
@@ -234,10 +236,23 @@ class BreakoutBot:
                 recent_3 = df.iloc[-3:] 
                 closes = recent_3['close'].values
                 opens = recent_3['open'].values
+                
+                # --- 조건 판단 ---
+                # 1. 흑삼병 (3연속 음봉)
                 is_three_crows = all(closes < opens)
-
+                # 2. 과매도 (RSI < 25)
                 is_oversold = current_rsi < RSI_REBOUND_LIMIT
+                # 3. 거래대금 폭발
                 is_vol_spike = (c['vol'] >= TURNOVER_THRESH)
+
+                # [디버깅] 전략 B - 3개 중 2개 이상 만족 시 '아까비' 로그 출력
+                cond_list_b = [is_three_crows, is_oversold, is_vol_spike]
+                if sum(cond_list_b) >= 2 and not all(cond_list_b):
+                    logj("missed_B", 
+                         msg="2/3 Matched",
+                         is_3_crows=str(is_three_crows),
+                         is_rsi_ok=f"{is_oversold} ({current_rsi:.1f})",
+                         is_vol_ok=f"{is_vol_spike} ({int(c['vol']):,})")
 
                 if is_three_crows and is_oversold and is_vol_spike:
                     with self.lock:
@@ -245,17 +260,25 @@ class BreakoutBot:
                         body_len = c['o'] - c['c']
                         target_raw = c['c'] + (body_len * Decimal("0.33"))
                         self.watch_target_r = adjust_price_to_tick(target_raw)
-                        
-                        logj("rebound_watch_on", 
-                             status="New Pattern Found",
-                             close=c['c'], 
-                             target=self.watch_target_r,
-                             rsi=f"{current_rsi:.1f}",
-                             vol_krw=f"{int(c['vol']):,}")
+                        logj("rebound_watch_on", status="Target Set", target=self.watch_target_r)
 
-            # [전략 A] 돌파 매매
-            if c['vol'] >= TURNOVER_THRESH and c['o'] < c['c']: 
-                is_valid_breakout = (current_rsi < RSI_LIMIT) and (c['c'] >= ma20)
+            # --- 전략 A 판단 ---
+            is_yangbong = (c['o'] < c['c'])
+            is_vol_ok_a = (c['vol'] >= TURNOVER_THRESH)
+            is_rsi_safe = (current_rsi < RSI_LIMIT)
+            is_above_ma = (c['c'] >= ma20)
+
+            # [디버깅] 전략 A - 주요 조건 3개(거래량, RSI, 이평선) 중 2개 이상 만족 시 로그
+            cond_list_a = [is_vol_ok_a, is_rsi_safe, is_above_ma]
+            if is_yangbong and sum(cond_list_a) >= 2 and not all(cond_list_a):
+                 logj("missed_A", 
+                      msg="2/3 Matched",
+                      vol_ok=f"{is_vol_ok_a} ({int(c['vol']):,})",
+                      rsi_safe=f"{is_rsi_safe} ({current_rsi:.1f})",
+                      above_ma=f"{is_above_ma} (Price:{c['c']} vs MA:{ma20:.1f})")
+
+            if is_vol_ok_a and is_yangbong: 
+                is_valid_breakout = is_rsi_safe and is_above_ma
                 with self.lock:
                     if is_valid_breakout:
                         self.watch_target_b = c['c']
@@ -265,7 +288,6 @@ class BreakoutBot:
                         self.watch_target_b = None
 
         except Exception:
-            # [적용됨] 에러 발생 시 Traceback(상세 라인) 로그 출력
             logj("err_analyze", trace=traceback.format_exc())
 
     def _enter(self, price, strategy_name):
@@ -277,14 +299,11 @@ class BreakoutBot:
             logj("buy_try", price=price, strat=strategy_name)
             
             r = self.api.buy_market(BUY_KRW_AMOUNT)
-            
             if r and r.get('uuid'):
                 self.in_pos = True
                 self.entry_price = Decimal(str(price))
-                
                 target_raw = self.entry_price * (Decimal("1") + TP_PCT)
                 target_price = adjust_price_to_tick(target_raw)
-                
                 self.sl_price = self.entry_price * (Decimal("1") - SL_PCT)
 
                 vol = Decimal("0")
@@ -308,14 +327,12 @@ class BreakoutBot:
                 self.is_rebound_ready = False
 
         except Exception:
-            # [적용됨] 에러 발생 시 Traceback(상세 라인) 로그 출력
             logj("err_enter_crit", trace=traceback.format_exc())
 
     def _sl(self, price):
         logj("sl_trigger", price=price)
         if self.tp_uuid: self.api.cancel_order(self.tp_uuid)
         time.sleep(0.2) 
-        
         vol = self.api.get_coin_free()
         if vol > 0: self.api.sell_market(vol)
         self._reset("SL_Done")
@@ -325,7 +342,6 @@ class BreakoutBot:
         self.entry_price = None
         self.tp_uuid = None
         self.sl_price = None
-        
         self.watch_target_b = None
         self.hold_start_b = None
         self.watch_target_r = None
@@ -350,6 +366,11 @@ class BreakoutBot:
             if p > self.cur_candle['h']: self.cur_candle['h'] = p
             if p < self.cur_candle['l']: self.cur_candle['l'] = p
             self.cur_candle['vol'] += (p*v)
+
+            now_ts = time.time()
+            if now_ts - self.last_alive_ts > 300:
+                logj("alive", price=f"{p:,}", vol_3min=f"{int(self.cur_candle['vol']):,}")
+                self.last_alive_ts = now_ts
 
             with self.lock:
                 if self.in_pos:
@@ -380,13 +401,12 @@ class BreakoutBot:
                         return
 
         except Exception:
-            # [적용됨] 틱 처리 중 에러 발생 시 Traceback 출력
             logj("err_tick", trace=traceback.format_exc())
 
     def start(self):
         logj("start", 
              setting=f"Coin:{SYMBOL}, Vol:>10억, TP:{TP_PCT}, Rebound:33%", 
-             msg="Bot Started with TRACEBACK & CUSTOM TICK")
+             msg="Bot Started with DEBUGGER & RSI FIX")
         
         while True:
             try:
