@@ -46,7 +46,7 @@ UPBIT_SECRET_KEY = os.getenv("UPBIT_SECRET_KEY", "6Yi02ssfxbXYzpOFlazpEjinLa6AVq
 
 SYMBOL             = "KRW-SOL" 
 BUY_KRW_AMOUNT     = Decimal("400000")
-TURNOVER_THRESH    = Decimal("1000000000") # [원복] 10억 원으로 유지
+TURNOVER_THRESH    = Decimal("1000000000") # 10억
 
 # 지표 설정
 RSI_PERIOD         = 9
@@ -152,6 +152,17 @@ class UpbitWrap:
             if b.get('currency') == coin: return Decimal(str(b.get('balance')))
         return Decimal("0")
 
+    # [수정] 묶인 코인(Locked)까지 포함한 '진짜 총 보유량' 조회 함수 추가
+    def get_coin_total(self):
+        bals = self._safe(self.u.get_balances) or []
+        coin = SYMBOL.split("-")[1]
+        for b in bals:
+            if b.get('currency') == coin:
+                # balance(주문가능) + locked(주문중)
+                total = Decimal(str(b.get('balance'))) + Decimal(str(b.get('locked')))
+                return total
+        return Decimal("0")
+
     def buy_market(self, krw):
         return self._safe(self.u.buy_market_order, SYMBOL, float(krw))
 
@@ -170,15 +181,11 @@ def calc_indicators(df):
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).fillna(0)
     loss = (-delta.where(delta < 0, 0)).fillna(0)
-    
-    # RSI Wilder's Smoothing (업비트 동일)
     avg_gain = gain.ewm(alpha=1/RSI_PERIOD, min_periods=RSI_PERIOD, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/RSI_PERIOD, min_periods=RSI_PERIOD, adjust=False).mean()
-    
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
     rsi = rsi.fillna(100)
-    
     ma20 = close.rolling(window=MA_PERIOD).mean()
     return rsi, ma20.iloc[-1], df['close'].iloc[-2], df['volume'].iloc[-2]
 
@@ -250,7 +257,6 @@ class BreakoutBot:
                         self.watch_target_r = adjust_price_to_tick(target_raw)
                         logj("rebound_watch_on", status="Target Set", target=self.watch_target_r)
 
-            # 전략 A
             is_yangbong = (c['o'] < c['c'])
             is_vol_ok_a = (c['vol'] >= TURNOVER_THRESH)
             is_rsi_safe = (current_rsi < RSI_LIMIT)
@@ -277,7 +283,6 @@ class BreakoutBot:
             logj("err_analyze", trace=traceback.format_exc())
 
     def _enter(self, price, strategy_name):
-        # [수정 1] 무한 루프 방지: 진입 시 감시 상태 즉시 초기화
         with self.lock:
             self.watch_target_b = None
             self.hold_start_b = None
@@ -288,13 +293,8 @@ class BreakoutBot:
             if self.in_pos: return
 
             krw = self.api.get_balance_krw()
-            
-            # [수정 2] TypeError 방지: 포맷팅({:,}) 제거하고 단순 str 변환 사용
             if krw < BUY_KRW_AMOUNT:
-                logj("err_balance", 
-                     msg="Not enough KRW", 
-                     have=str(krw), 
-                     need=str(BUY_KRW_AMOUNT))
+                logj("err_balance", msg="Not enough KRW", have=str(krw), need=str(BUY_KRW_AMOUNT))
                 return
 
             logj("buy_try", price=price, strat=strategy_name)
@@ -326,18 +326,38 @@ class BreakoutBot:
                 logj("buy_fail", msg=str(r))
 
         except TypeError:
-            # TypeError 발생 시 원인 강제 출력
             print("\n[CRITICAL_TYPE_ERROR_CAUGHT]", flush=True)
             traceback.print_exc()
         except Exception:
             logj("err_enter_crit", trace=traceback.format_exc())
 
     def _sl(self, price):
-        logj("sl_trigger", price=price)
-        if self.tp_uuid: self.api.cancel_order(self.tp_uuid)
-        time.sleep(0.2) 
-        vol = self.api.get_coin_free()
-        if vol > 0: self.api.sell_market(vol)
+        # [수정] 손절 로직 강화 (확실하게 던지기)
+        logj("sl_trigger", price=price, msg="Canceling TP & Selling Market")
+        
+        # 1. 예약된 익절 취소
+        if self.tp_uuid:
+            try:
+                self.api.cancel_order(self.tp_uuid)
+            except Exception:
+                pass
+            self.tp_uuid = None
+
+        # 2. 취소된 물량이 지갑에 잡힐 때까지 대기 (최대 5초)
+        vol = Decimal("0")
+        for i in range(25): # 0.2초 * 25회
+            time.sleep(0.2)
+            vol = self.api.get_coin_free()
+            if vol > 0: 
+                break
+        
+        # 3. 시장가 전량 매도
+        if vol > 0:
+            res = self.api.sell_market(vol)
+            logj("sl_exec", price=price, vol=str(vol), msg="Market Sell Done")
+        else:
+            logj("sl_fail", price=price, msg="No Balance? Check Logic")
+
         self._reset("SL_Done")
 
     def _reset(self, reason):
@@ -373,7 +393,6 @@ class BreakoutBot:
             now_ts = time.time()
             if now_ts - self.last_alive_ts > 300:
                 my_krw = self.api.get_balance_krw()
-                # [수정] TypeError 방지를 위해 balance도 str로 변환
                 logj("alive", price=f"{p:,}", vol_3min=f"{int(self.cur_candle['vol']):,}", balance=str(my_krw))
                 self.last_alive_ts = now_ts
 
@@ -384,7 +403,9 @@ class BreakoutBot:
                         return
                     elif self.tp_uuid:
                         if time.time() - self.tp_check_ts > 2:
-                            if self.api.get_coin_free() < Decimal("0.0001"):
+                            # [핵심 수정] get_coin_free() 대신 get_coin_total() 사용
+                            # 주문 걸린(locked) 물량도 내 잔고로 쳐야 봇이 오해 안 함
+                            if self.api.get_coin_total() < Decimal("0.0001"):
                                 self._reset("TP_Done")
                             self.tp_check_ts = time.time()
                     return
@@ -409,12 +430,11 @@ class BreakoutBot:
             logj("err_tick", trace=traceback.format_exc())
 
     def start(self):
-        # [요청 반영] 시작 시 잔고 로그 출력
         init_krw = self.api.get_balance_krw()
         logj("start", 
              setting=f"Coin:{SYMBOL}, Vol:>10억, TP:{TP_PCT}, Rebound:33%", 
-             msg="Bot Started with TypeError FIX & Init Balance Log",
-             init_balance=str(init_krw)) # str 변환 필수
+             msg="Bot Started - Locked Coin Awareness Added",
+             init_balance=str(init_krw))
         
         while True:
             try:
