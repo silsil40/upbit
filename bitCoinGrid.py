@@ -35,8 +35,8 @@ getcontext().prec = 28
 # ==========================================
 # [사용자 설정 영역]
 # ==========================================
-UPBIT_ACCESS_KEY = os.getenv("UPBIT_ACCESS_KEY", "")
-UPBIT_SECRET_KEY = os.getenv("UPBIT_SECRET_KEY", "")
+UPBIT_ACCESS_KEY = os.getenv("UPBIT_ACCESS_KEY", "po04aXLppNilEDtmtkMVGMcL2VaaQTSU4aIy8xLy")
+UPBIT_SECRET_KEY = os.getenv("UPBIT_SECRET_KEY", "6Yi02ssfxbXYzpOFlazpEjinLa6AVq3960lpxEzJ")
 
 SYMBOL           = "KRW-SOL"
 BUY_AMOUNT_KRW   = Decimal("10000")  # 각 그리드당 1만원
