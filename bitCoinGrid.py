@@ -40,11 +40,11 @@ UPBIT_ACCESS_KEY = os.getenv("UPBIT_ACCESS_KEY", "po04aXLppNilEDtmtkMVGMcL2VaaQT
 UPBIT_SECRET_KEY = os.getenv("UPBIT_SECRET_KEY", "6Yi02ssfxbXYzpOFlazpEjinLa6AVq3960lpxEzJ")
 
 SYMBOL           = "KRW-SOL"
-BUY_AMOUNT_KRW   = Decimal("10000")   # 테스트 완료 후 250000으로 수정하세요
+BUY_AMOUNT_KRW   = Decimal("200000")   # 매수 기준 금액
 GRID_GAP_PCT     = Decimal("0.003") 
 PROFIT_PCT       = Decimal("0.005") 
 MAX_LAYERS       = 5                
-MAX_INVENTORY    = 40               
+MAX_INVENTORY    = 50                 # 맥스 매수 갯수
 STATE_FILE       = "grid_state.json"  
 # ==========================================
 
