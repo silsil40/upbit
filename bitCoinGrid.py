@@ -6,19 +6,19 @@
 1. 기본 환경 및 자산 관리
    - 대상: KRW-SOL (솔라나)
    - 방식: 촘촘한 스캘핑 (Grid Scalping) 기반의 자석식 추적
-   - 예산: 그리드당 250,000원 x 40슬롯 = 총 1,000만 원 운용 (설정 가변)
-   - 사전 점검: 가동 시 보유 현금(KRW) 및 주문 가능 금액 실시간 모니터링
+   - 예산: 그리드당 200,000원 x 1000슬롯 = 무제한 확장 대응
+   - [신규] 동적 잔고 확인: 가동 시점의 총 자산(현금+코인)을 자동 계산하여 수익 기준점 수립
 
 2. 크롤링 그리드(Crawling Grid) 추적 전략
    - 진입: 현재가 기준 하단 0.3% 간격으로 5단계 그물망 상시 유지
-   - 전진 배치(Shift Up): 가격 상승으로 그물이 멀어지면 최하단 주문을 취소 후 현재가 밑으로 밀착 전진
-   - 하락 대응: 매수 체결 시 즉시 +0.5% 지정가 익절 매도(TP) 실행 및 하단 그물 자동 보충
+   - 전진 배치(Shift Up): 가격 상승 시 최하단 주문을 취소 후 현재가 밑으로 밀착 전진
+   - 하락 대응: 매수 체결 시 즉시 +0.5% 지정가 익절 매도(TP) 실행
 
-3. 엔터프라이즈급 안정성 및 예외 처리 (v2.5~v2.8 핵심)
-   - 부분 체결 구제: Shift Up 시 미체결 취소 전, 이미 체결된 수량(Partial Fill)은 즉각 매도로 전환하여 자산 미아 방지
-   - 상태 보존(Persistence): grid_state.json 파일을 통해 매수/매도 장부를 실시간 저장 및 재시작 시 100% 자동 복구
-   - API 보호: 호출 간 0.1~0.2s 지연(Sleep) 및 루프 예외 처리를 통해 업비트 Rate Limit 차단 및 24시간 무중단 가동 보장
-   - 데이터 무결성: Decimal 연산 및 Atomic Write(임시 파일 교체 방식) 적용으로 장부 깨짐 방지
+3. 엔터프라이즈급 안정성 및 실시간 추적 (v2.9.2)
+   - [신규] 순수익 로그: 매도 성공 시 양방향 수수료(0.1%)를 제외한 실제 현금 증가분(Net Profit) 기록
+   - 부분 체결 구제: Shift Up 시 이미 체결된 수량은 즉각 매도로 전환하여 자산 미아 방지
+   - 상태 보존: grid_state.json 파일을 통해 장부 실시간 저장 및 복구
+   - API 보호: 호출 간 지연 및 루프 예외 처리를 통해 24시간 무중단 가동
 """
 
 import os
@@ -44,7 +44,7 @@ BUY_AMOUNT_KRW   = Decimal("200000")   # 매수 기준 금액
 GRID_GAP_PCT     = Decimal("0.003") 
 PROFIT_PCT       = Decimal("0.005") 
 MAX_LAYERS       = 5                
-MAX_INVENTORY    = 50                 # 맥스 매수 갯수
+MAX_INVENTORY    = 1000                 # 맥스 매수 슬롯 1000개
 STATE_FILE       = "grid_state.json"  
 # ==========================================
 
@@ -59,13 +59,40 @@ def adjust_price(price):
     else: tick = Decimal("1")
     return (p / tick).to_integral_value(rounding='ROUND_FLOOR') * tick
 
-class EnterpriseFinalBotV28:
+class EnterpriseFinalBotV292:
     def __init__(self):
         self.upbit = pyupbit.Upbit(UPBIT_ACCESS_KEY, UPBIT_SECRET_KEY)
         self.lock = threading.Lock()
         self.grid_map = {} 
         self.current_price = Decimal("0")
+        
+        # [실시간 수익 추적용 변수]
+        self.start_total_asset = Decimal("0") 
+        self.cumulative_net_profit = Decimal("0")
+        
         self.load_state()
+
+    def get_total_asset(self):
+        """현재 계좌의 총 가치(현금 + 주문중인 현금 + 보유 코인 평가액) 자동 계산"""
+        try:
+            balances = self.upbit.get_balances()
+            total = Decimal("0")
+            # 현재가 기반 평가를 위해 최신가 호출
+            curr_p = pyupbit.get_current_price(SYMBOL)
+            if not curr_p: return Decimal("0")
+            curr_p_dec = Decimal(str(curr_p))
+
+            for b in balances:
+                coin = b['currency']
+                if coin == "KRW":
+                    total += (Decimal(b['balance']) + Decimal(b['locked']))
+                elif coin == SYMBOL.split('-')[1]: # SOL 등 대상 코인
+                    total += (Decimal(b['balance']) + Decimal(b['locked'])) * curr_p_dec
+            
+            return total
+        except Exception:
+            logj("err_get_asset", trace=traceback.format_exc())
+            return Decimal("0")
 
     def save_state(self):
         try:
@@ -84,8 +111,7 @@ class EnterpriseFinalBotV28:
             logj("err_save", trace=traceback.format_exc())
 
     def load_state(self):
-        if not os.path.exists(STATE_FILE):
-            return
+        if not os.path.exists(STATE_FILE): return
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 raw_map = json.load(f)
@@ -101,16 +127,16 @@ class EnterpriseFinalBotV28:
 
     def init_clear_and_seed(self):
         try:
-            # [신규] 시작 시 지갑 잔고 확인 로그
-            krw_balance = self.upbit.get_balance("KRW")
-            logj("wallet_status", 
-                 available_krw=format(int(krw_balance), ','), 
-                 buy_unit=format(int(BUY_AMOUNT_KRW), ','),
-                 msg="Checking funds before start...")
-
-            logj("init_clear", msg="Cleaning old bid orders...")
-            orders = self.upbit.get_order(SYMBOL, state='wait') or []
+            # 시작 시점의 총 자산 기록 (기준점)
+            self.start_total_asset = self.get_total_asset()
+            krw_balance = Decimal(str(self.upbit.get_balance("KRW")))
             
+            logj("bot_session_init", 
+                 start_total_asset=format(int(self.start_total_asset), ','),
+                 available_krw=format(int(krw_balance), ','),
+                 msg="Session baseline established.")
+
+            orders = self.upbit.get_order(SYMBOL, state='wait') or []
             for o in orders:
                 if o['side'] == 'bid' and o['uuid'] not in self.grid_map:
                     self.upbit.cancel_order(o['uuid'])
@@ -120,13 +146,14 @@ class EnterpriseFinalBotV28:
                 curr = pyupbit.get_current_price(SYMBOL)
                 if not curr: return
                 seed_p = adjust_price(curr)
-                vol = BUY_AMOUNT_KRW / seed_p
-                res = self.upbit.buy_limit_order(SYMBOL, float(seed_p), float(vol))
-                if res and 'uuid' in res:
-                    sell_p = adjust_price(seed_p * (Decimal("1") + PROFIT_PCT))
-                    self.grid_map[res['uuid']] = {'buy_price': seed_p, 'sell_price': sell_p, 'side': 'bid'}
-                    logj("seed_buy_placed", price=str(seed_p))
-                    self.save_state()
+                if krw_balance >= BUY_AMOUNT_KRW:
+                    vol = BUY_AMOUNT_KRW / seed_p
+                    res = self.upbit.buy_limit_order(SYMBOL, float(seed_p), float(vol))
+                    if res and 'uuid' in res:
+                        sell_p = adjust_price(seed_p * (Decimal("1") + PROFIT_PCT))
+                        self.grid_map[res['uuid']] = {'buy_price': seed_p, 'sell_price': sell_p, 'side': 'bid'}
+                        logj("seed_buy_placed", price=str(seed_p))
+                        self.save_state()
         except Exception:
             logj("err_init", trace=traceback.format_exc())
 
@@ -134,6 +161,7 @@ class EnterpriseFinalBotV28:
         try:
             with self.lock:
                 if len(self.grid_map) >= MAX_INVENTORY: return
+                balance = Decimal(str(self.upbit.get_balance("KRW")))
 
                 orders = self.upbit.get_order(SYMBOL, state='wait') or []
                 buy_orders = sorted([o for o in orders if o['side'] == 'bid'], 
@@ -144,7 +172,6 @@ class EnterpriseFinalBotV28:
                     if (self.current_price - highest_buy) / self.current_price > (GRID_GAP_PCT + Decimal("0.001")):
                         lowest_order = buy_orders[-1]
                         uuid_to_cancel = lowest_order['uuid']
-                        
                         detail = self.upbit.get_order(uuid_to_cancel)
                         part_vol = Decimal(str(detail.get('executed_volume', '0'))) if detail else Decimal("0")
                         
@@ -157,23 +184,22 @@ class EnterpriseFinalBotV28:
                             if s_res:
                                 self.grid_map[s_res['uuid']] = {'buy_price': info['buy_price'], 'sell_price': info['sell_price'], 'side': 'ask'}
                         
-                        if uuid_to_cancel in self.grid_map:
-                            del self.grid_map[uuid_to_cancel]
-                        
+                        if uuid_to_cancel in self.grid_map: del self.grid_map[uuid_to_cancel]
                         logj("shift_up", cancelled=str(lowest_order['price']))
                         self.save_state()
                         buy_orders.pop()
 
-                existing_prices = [info['buy_price'] for info in self.grid_map.values()]
+                existing_prices = [info['buy_price'] for info in self.grid_map.values() if info['side'] == 'bid']
                 for i in range(1, MAX_LAYERS + 1):
+                    if balance < (BUY_AMOUNT_KRW * Decimal("1.0005")): break
                     target_p = adjust_price(self.current_price * (Decimal("1") - GRID_GAP_PCT * i))
-                    min_dist = target_p * Decimal("0.0015")
-                    if any(abs(p - target_p) < min_dist for p in existing_prices): continue
+                    if any(abs(p - target_p) < (target_p * Decimal("0.0015")) for p in existing_prices): continue
 
-                    if len(buy_orders) < MAX_LAYERS and len(self.grid_map) < MAX_INVENTORY:
+                    if len(buy_orders) < MAX_LAYERS:
                         vol = BUY_AMOUNT_KRW / target_p
                         res = self.upbit.buy_limit_order(SYMBOL, float(target_p), float(vol))
                         if res and 'uuid' in res:
+                            balance -= (BUY_AMOUNT_KRW * Decimal("1.0005"))
                             sell_p = adjust_price(target_p * (Decimal("1") + PROFIT_PCT))
                             self.grid_map[res['uuid']] = {'buy_price': target_p, 'sell_price': sell_p, 'side': 'bid'}
                             logj("place_buy", price=str(target_p))
@@ -192,8 +218,11 @@ class EnterpriseFinalBotV28:
                     uid = o['uuid']
                     if uid in self.grid_map:
                         info = self.grid_map[uid]
+                        vol = Decimal(str(o['executed_volume']))
+                        price = Decimal(str(o['price']))
+
                         if info['side'] == 'bid':
-                            s_res = self.upbit.sell_limit_order(SYMBOL, float(info['sell_price']), float(o['executed_volume']))
+                            s_res = self.upbit.sell_limit_order(SYMBOL, float(info['sell_price']), float(vol))
                             if s_res:
                                 del self.grid_map[uid]
                                 self.grid_map[s_res['uuid']] = {'buy_price': info['buy_price'], 'sell_price': info['sell_price'], 'side': 'ask'}
@@ -201,7 +230,19 @@ class EnterpriseFinalBotV28:
                                 changed = True
                         elif info['side'] == 'ask':
                             del self.grid_map[uid]
-                            logj("trade_success", price=str(info['sell_price']))
+                            
+                            # --- [순수익 추적: Net Profit] ---
+                            buy_cost = info['buy_price'] * vol
+                            sell_rev = price * vol
+                            # 수수료 양방향 0.05%씩 차감한 순수익 계산
+                            net_profit = (sell_rev * Decimal("0.9995")) - (buy_cost * Decimal("1.0005"))
+                            self.cumulative_net_profit += net_profit
+                            
+                            logj("trade_success", 
+                                 buy=format(int(info['buy_price']), ','), 
+                                 sell=format(int(price), ','),
+                                 profit=str(round(net_profit, 2)), 
+                                 session_total=str(round(self.cumulative_net_profit, 2)))
                             changed = True
                 if changed: self.save_state()
         except Exception:
@@ -209,7 +250,7 @@ class EnterpriseFinalBotV28:
 
     def run(self):
         self.init_clear_and_seed()
-        logj("bot_start", msg=f"v2.8 Enterprise Ready. Max: {MAX_INVENTORY}")
+        logj("bot_start", msg=f"v2.9.2 Active. Baseline Asset: {format(int(self.start_total_asset), ',')}")
         wm = WebSocketManager("ticker", [SYMBOL])
         last_t = 0
         while True:
@@ -226,4 +267,4 @@ class EnterpriseFinalBotV28:
                 time.sleep(2)
 
 if __name__ == "__main__":
-    EnterpriseFinalBotV28().run()
+    EnterpriseFinalBotV292().run()
