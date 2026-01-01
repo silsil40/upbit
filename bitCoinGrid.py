@@ -4,21 +4,22 @@
 [전략 요약: 업비트 솔라나(SOL) 엔터프라이즈급 밀착 추적 그리드 봇]
 
 1. 기본 환경 및 자산 관리
-   - 대상: KRW-SOL (솔라나)
-   - 방식: 촘촘한 스캘핑 (Grid Scalping) 기반의 자석식 추적
-   - 예산: 그리드당 200,000원 x 1000슬롯 = 무제한 확장 대응
-   - [신규] 동적 잔고 확인: 가동 시점의 총 자산(현금+코인)을 자동 계산하여 수익 기준점 수립
+    - 대상: KRW-SOL (솔라나)
+    - 방식: 촘촘한 스캘핑 (Grid Scalping) 기반의 자석식 추적
+    - 예산: 그리드당 200,000원 x 1000슬롯 = 무제한 확장 대응
+    - [신규] 동적 잔고 확인: 가동 시점의 총 자산(현금+코인)을 자동 계산하여 수익 기준점 수립
 
 2. 크롤링 그리드(Crawling Grid) 추적 전략
-   - 진입: 현재가 기준 하단 0.3% 간격으로 5단계 그물망 상시 유지
-   - 전진 배치(Shift Up): 가격 상승 시 최하단 주문을 취소 후 현재가 밑으로 밀착 전진
-   - 하락 대응: 매수 체결 시 즉시 +0.5% 지정가 익절 매도(TP) 실행
+    - 진입: 현재가 기준 하단 0.3% 간격으로 5단계 그물망 상시 유지
+    - [복구] 보수적 간격 유지: 매수/매도 주문 구분 없이 모든 주문과의 거리를 체크하여 촘촘한 중복 매수 방지 (v2.8 로직)
+    - 전진 배치(Shift Up): 가격 상승 시 최하단 주문을 취소 후 현재가 밑으로 밀착 전진
+    - 하락 대응: 매수 체결 시 즉시 +0.5% 지정가 익절 매도(TP) 실행
 
-3. 엔터프라이즈급 안정성 및 실시간 추적 (v2.9.2)
-   - [신규] 순수익 로그: 매도 성공 시 양방향 수수료(0.1%)를 제외한 실제 현금 증가분(Net Profit) 기록
-   - 부분 체결 구제: Shift Up 시 이미 체결된 수량은 즉각 매도로 전환하여 자산 미아 방지
-   - 상태 보존: grid_state.json 파일을 통해 장부 실시간 저장 및 복구
-   - API 보호: 호출 간 지연 및 루프 예외 처리를 통해 24시간 무중단 가동
+3. 엔터프라이즈급 안정성 및 실시간 추적 (v2.9.3)
+    - [신규] 순수익 로그: 매도 성공 시 양방향 수수료(0.1%)를 제외한 실제 현금 증가분(Net Profit) 기록
+    - 부분 체결 구제: Shift Up 시 이미 체결된 수량은 즉각 매도로 전환하여 자산 미아 방지
+    - 상태 보존: grid_state.json 파일을 통해 장부 실시간 저장 및 복구
+    - API 보호: 호출 간 지연 및 루프 예외 처리를 통해 24시간 무중단 가동
 """
 
 import os
@@ -77,7 +78,6 @@ class EnterpriseFinalBotV292:
         try:
             balances = self.upbit.get_balances()
             total = Decimal("0")
-            # 현재가 기반 평가를 위해 최신가 호출
             curr_p = pyupbit.get_current_price(SYMBOL)
             if not curr_p: return Decimal("0")
             curr_p_dec = Decimal(str(curr_p))
@@ -127,7 +127,6 @@ class EnterpriseFinalBotV292:
 
     def init_clear_and_seed(self):
         try:
-            # 시작 시점의 총 자산 기록 (기준점)
             self.start_total_asset = self.get_total_asset()
             krw_balance = Decimal(str(self.upbit.get_balance("KRW")))
             
@@ -189,10 +188,14 @@ class EnterpriseFinalBotV292:
                         self.save_state()
                         buy_orders.pop()
 
-                existing_prices = [info['buy_price'] for info in self.grid_map.values() if info['side'] == 'bid']
+                # [복구] v2.8 방식으로 수정: side 구분 없이 모든 장부상의 주문을 체크하여 안전 간격을 유지합니다.
+                existing_prices = [info['buy_price'] for info in self.grid_map.values()]
+                
                 for i in range(1, MAX_LAYERS + 1):
                     if balance < (BUY_AMOUNT_KRW * Decimal("1.0005")): break
                     target_p = adjust_price(self.current_price * (Decimal("1") - GRID_GAP_PCT * i))
+                    
+                    # 매수/매도 주문 근처 0.15% 이내에는 주문을 내지 않음
                     if any(abs(p - target_p) < (target_p * Decimal("0.0015")) for p in existing_prices): continue
 
                     if len(buy_orders) < MAX_LAYERS:
@@ -234,7 +237,6 @@ class EnterpriseFinalBotV292:
                             # --- [순수익 추적: Net Profit] ---
                             buy_cost = info['buy_price'] * vol
                             sell_rev = price * vol
-                            # 수수료 양방향 0.05%씩 차감한 순수익 계산
                             net_profit = (sell_rev * Decimal("0.9995")) - (buy_cost * Decimal("1.0005"))
                             self.cumulative_net_profit += net_profit
                             
@@ -250,7 +252,7 @@ class EnterpriseFinalBotV292:
 
     def run(self):
         self.init_clear_and_seed()
-        logj("bot_start", msg=f"v2.9.2 Active. Baseline Asset: {format(int(self.start_total_asset), ',')}")
+        logj("bot_start", msg=f"v2.9.3 Active. Baseline Asset: {format(int(self.start_total_asset), ',')}")
         wm = WebSocketManager("ticker", [SYMBOL])
         last_t = 0
         while True:
