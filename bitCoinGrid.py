@@ -4,20 +4,20 @@
 [전략 요약: KRW-SOL 지능형 방어 그리드 봇 v3.0]
 
 1. 4단계 지능형 태세 전환 (State Machine)
-   - Normal: 평시 수익 모드 (0.3% 간격 / 20만 원)
-   - Caution: 흐름 불안 (0.6% 간격 / 20만 원) - 수익정체 1h OR 낙폭 -3% OR 강도 < 60%
-   - Defensive: 하락장 대응 (1.0% 간격 / 20만 원) - 수익정체 2h OR 낙폭 -5% OR 강도 < 40%
-   - Freeze: 투매 발생 (매수 중단) - 낙폭 -10% OR 강도 < 20%
+    - Normal: 평시 수익 모드 (0.3% 간격 / 20만 원)
+    - Caution: 흐름 불안 (0.6% 간격 / 20만 원) - 수익정체 1h OR 낙폭 -3% OR 강도 < 60%
+    - Defensive: 하락장 대응 (1.0% 간격 / 20만 원) - 수익정체 2h OR 낙폭 -5% OR 강도 < 40%
+    - Freeze: 투매 발생 (매수 중단) - 낙폭 -10% OR 강도 < 20%
 
 2. 실시간 데이터 분석 (Decision Intelligence)
-   - Rolling 24h High: 최근 24시간 내 최고가 대비 낙폭(MDD) 실시간 추적
-   - Volume Power (1h): 최근 1시간 매수/매도 체결량 비율 실시간 집계
-   - TP Stagnation: 마지막 익절 발생 후 경과 시간 추적
+    - Rolling 24h High: 최근 24시간 내 최고가 대비 낙폭(MDD) 실시간 추적
+    - Volume Power (1h): 최근 1시간 매수/매도 체결량 비율 실시간 집계
+    - TP Stagnation: 마지막 익절 발생 후 경과 시간 추적
 
 3. 리그리딩 시스템 (Clean & Rebuild)
-   - 모드 상향/하향 시 기존 매수 주문(Bid) 전량 취소 후 새로운 간격으로 재배치
-   - 매도 주문(Ask)은 수익 확보를 위해 어떤 경우에도 유지 (탈출구 전략)
-   - 매도 체결 시 즉시 Normal 모드 복구 (회복 탄력성)
+    - 모드 상향/하향 시 기존 매수 주문(Bid) 전량 취소 후 새로운 간격으로 재배치
+    - 매도 주문(Ask)은 수익 확보를 위해 어떤 경우에도 유지 (탈출구 전략)
+    - 매도 체결 시 즉시 Normal 모드 복구 (회복 탄력성)
 """
 
 import os
@@ -112,6 +112,27 @@ class EnterpriseShieldBotV3:
             os.replace(tmp_file, STATE_FILE)
         except Exception:
             logj("err_save", trace=traceback.format_exc())
+
+    def get_total_asset(self):
+        """현재 계좌의 총 가치(현금 + 주문중인 현금 + 보유 코인 평가액) 자동 계산"""
+        try:
+            balances = self.upbit.get_balances()
+            total = Decimal("0")
+            curr_p = pyupbit.get_current_price(SYMBOL)
+            if not curr_p: return Decimal("0")
+            curr_p_dec = Decimal(str(curr_p))
+
+            for b in balances:
+                coin = b['currency']
+                if coin == "KRW":
+                    total += (Decimal(b['balance']) + Decimal(b['locked']))
+                elif coin == SYMBOL.split('-')[1]: # SOL 등 대상 코인
+                    total += (Decimal(b['balance']) + Decimal(b['locked'])) * curr_p_dec
+            
+            return total
+        except Exception:
+            logj("err_get_asset", trace=traceback.format_exc())
+            return Decimal("0")
 
     def update_24h_high(self):
         """실시간 롤링 윈도우 24시간 최고가 업데이트 (5분 주기)"""
@@ -268,8 +289,6 @@ class EnterpriseShieldBotV3:
 
     def run(self):
         # 자산 초기화
-        balances = self.upbit.get_balances()
-        krw_val = next((Decimal(b['balance']) for b in balances if b['currency'] == 'KRW'), Decimal("0"))
         self.start_total_asset = self.get_total_asset()
         logj("bot_start", v="3.0 Shield", base_asset=format(int(self.start_total_asset), ','))
 
@@ -283,8 +302,7 @@ class EnterpriseShieldBotV3:
                 
                 self.current_price = Decimal(str(data['trade_price']))
                 
-                # 체결 강도 데이터 수집 (BID: 매수체결(빨간색), ASK: 매도체결(파란색))
-                # 업비트 웹소켓 ticker 데이터의 ask_bid는 'ASK'가 매도체결, 'BID'가 매수체결임
+                # 체결 강도 데이터 수집 (BID: 매수체결, ASK: 매도체결)
                 self.trade_history.append((time.time(), Decimal(str(data['trade_volume'])), data['ask_bid']))
                 
                 if time.time() - last_loop_time > 4:
@@ -300,10 +318,10 @@ class EnterpriseShieldBotV3:
                     self.maintain_grid()
                     self.check_fill()
                     
-                    # 모니터링 로그
-                    mdd = (self.current_price - self.rolling_24h_high) / self.rolling_24h_high if self.rolling_24h_high > 0 else 0
+                    # 모니터링 로그 (LaTeX 개념 적용: MDD 및 체결강도)
+                    mdd_val = (self.current_price - self.rolling_24h_high) / self.rolling_24h_high if self.rolling_24h_high > 0 else 0
                     logj("status", mode=self.current_mode, price=format(int(self.current_price), ','), 
-                         mdd=f"{round(mdd*100, 2)}%", v_power=f"{round(self.get_volume_power(), 1)}%",
+                         mdd=f"{round(mdd_val*100, 2)}%", v_power=f"{round(self.get_volume_power(), 1)}%",
                          stagnation=f"{round((time.time()-self.last_tp_time)/60, 1)}m")
                     
                     last_loop_time = time.time()
