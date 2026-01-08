@@ -44,7 +44,6 @@ PROFIT_PCT       = Decimal("0.005") # 0.5%
 
 # --- [리스크 판단 엔진 설정] ---
 VP_WINDOW_SEC      = 1800      # 체결강도 분석 범위: 30분
-MIN_TOTAL_VOL_KRW  = 5000000   # 최소 신뢰 거래대금: 500만 원 (노이즈 필터)
 
 # --- [모드 전환 임계값 (Active Meat)] ---
 # 1. CAUTION (주의): -5% 하락 OR 체결강도 40% 미만
@@ -151,7 +150,7 @@ class EnterpriseShieldBotV3_2:
         except: pass
 
     def get_volume_power(self):
-        """30분 윈도우 + 500만 원 노이즈 필터 적용 체결강도 계산"""
+        """30분 윈도우 기반 순수 체결강도 계산 (금액 필터 제거)"""
         now = time.time()
         while self.trade_history and now - self.trade_history[0][0] > VP_WINDOW_SEC:
             self.trade_history.popleft()
@@ -159,13 +158,7 @@ class EnterpriseShieldBotV3_2:
         buy_vol = sum(vol for ts, vol, side in self.trade_history if side == 'BID')
         sell_vol = sum(vol for ts, vol, side in self.trade_history if side == 'ASK')
         
-        # 총 거래대금(KRW) 계산
-        total_vol_krw = (Decimal(str(buy_vol)) + Decimal(str(sell_vol))) * self.current_price
-        
-        # [노이즈 필터링] 총 거래량이 임계값 미만이면 시장이 조용한 것이므로 100% 반환
-        if total_vol_krw < MIN_TOTAL_VOL_KRW:
-            return Decimal("100.0")
-            
+        # 제로 나누기 방지 및 거래 전무 상황 처리
         if sell_vol == 0: return Decimal("100.0")
         return (Decimal(str(buy_vol)) / Decimal(str(sell_vol))) * 100
 
