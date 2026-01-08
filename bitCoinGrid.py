@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-[전략 요약: KRW-SOL 액티브 미트(Active Meat) v3.2]
+[KRW-SOL Active Meat v3.2.1 - 전략 명세서]
 
-1. 순수 데이터 기반 태세 전환 (Time-Stagnation Removed)
-   - 시간 정체 조건을 제거하여 시장이 조용해도 NORMAL 모드에서 지속적으로 수익을 추구합니다.
-   - 오직 MDD(낙폭)와 VP(체결강도) 데이터만으로 리스크를 판단합니다.
+1. 액티브 미트(Active Meat): 시간 정체(Stagnation) 조건 완전 제거
+   - 익절 발생 여부와 상관없이 24시간 멈추지 않고 수익 사냥 (NORMAL 모드 극대화)
+   - 오직 가격 낙폭(MDD)과 시장 체결 에너지(VP)로만 리스크 판단
 
-2. 30분 단위 예리한 체결강도 분석 (30-min VP Window)
-   - 분석 윈도우를 60분에서 30분으로 단축하여 시장의 급변에 기민하게 반응합니다.
+2. 고해상도 리스크 엔진: 30분 슬라이딩 윈도우
+   - 체결강도 분석 범위를 60분에서 30분으로 단축하여 시장 급변에 즉각 대응
 
-3. 500만 원 거래량 노이즈 필터 (Noise Filter)
-   - 30분간 총 거래대금이 500만 원 미만일 경우, 발생하는 체결강도 수치를 무시하고
-     NORMAL 상태를 유지하여 소액 노이즈에 의한 오작동을 방지합니다.
+3. 로버스트 필터(Robust Filter): 10억 원 데이터 신뢰 임계값
+   - 최근 30분간 솔라나 시장 전체 거래 합계가 10억 원 미만일 경우 VP 판단 유보
+   - 소액 노이즈에 의한 잦은 모드 전환을 방지하고 통계적 유의미함 확보
 
-4. 밸런스형 수익 구간 확보
-   - 솔라나 특성을 반영하여 MDD -5%까지는 NORMAL 모드를 유지, 수익의 '살코기'를 극대화합니다.
+4. 공격적 하방 지지: MDD -5% 가이드라인
+   - -5% 하락 전까지는 0.3% 간격의 촘촘한 그리드를 유지하여 반등 수익 확보
 """
 
 import os
@@ -43,9 +43,10 @@ BASE_GRID_GAP    = Decimal("0.003") # 0.3%
 PROFIT_PCT       = Decimal("0.005") # 0.5%
 
 # --- [리스크 판단 엔진 설정] ---
-VP_WINDOW_SEC      = 1800      # 체결강도 분석 범위: 30분
+VP_WINDOW_SEC      = 1800           # 분석 범위: 30분
+MIN_TOTAL_VOL_KRW  = 1000000000     # 데이터 신뢰 임계값: 10억 원
 
-# --- [모드 전환 임계값 (Active Meat)] ---
+# --- [모드 전환 임계값] ---
 # 1. CAUTION (주의): -5% 하락 OR 체결강도 40% 미만
 CAUTION_MDD      = Decimal("-0.05")
 CAUTION_VP       = Decimal("40.0")
@@ -75,7 +76,7 @@ def adjust_price(price):
     else: tick = Decimal("1")
     return (p / tick).to_integral_value(rounding='ROUND_FLOOR') * tick
 
-class EnterpriseShieldBotV3_2:
+class EnterpriseShieldBotV3_2_1:
     def __init__(self):
         self.upbit = pyupbit.Upbit(UPBIT_ACCESS_KEY, UPBIT_SECRET_KEY)
         self.lock = threading.Lock()
@@ -86,7 +87,7 @@ class EnterpriseShieldBotV3_2:
         self.last_mode = "NORMAL"
         self.rolling_24h_high = Decimal("0")
         self.last_high_update = 0
-        self.trade_history = deque() # (timestamp, volume, side)
+        self.trade_history = deque() 
         self.cumulative_net_profit = Decimal("0")
         
         self.load_state()
@@ -150,7 +151,7 @@ class EnterpriseShieldBotV3_2:
         except: pass
 
     def get_volume_power(self):
-        """30분 윈도우 기반 순수 체결강도 계산 (금액 필터 제거)"""
+        """10억 원 필터가 적용된 고신뢰 체결강도 산출"""
         now = time.time()
         while self.trade_history and now - self.trade_history[0][0] > VP_WINDOW_SEC:
             self.trade_history.popleft()
@@ -158,12 +159,15 @@ class EnterpriseShieldBotV3_2:
         buy_vol = sum(vol for ts, vol, side in self.trade_history if side == 'BID')
         sell_vol = sum(vol for ts, vol, side in self.trade_history if side == 'ASK')
         
-        # 제로 나누기 방지 및 거래 전무 상황 처리
+        total_vol_krw = (Decimal(str(buy_vol)) + Decimal(str(sell_vol))) * self.current_price
+        
+        if total_vol_krw < MIN_TOTAL_VOL_KRW:
+            return Decimal("100.0")
+            
         if sell_vol == 0: return Decimal("100.0")
         return (Decimal(str(buy_vol)) / Decimal(str(sell_vol))) * 100
 
     def decide_mode(self):
-        """시간 조건 완전 제거: MDD와 체결강도만으로 판단"""
         if self.rolling_24h_high == 0: return "NORMAL"
         
         mdd = (self.current_price - self.rolling_24h_high) / self.rolling_24h_high
@@ -187,7 +191,7 @@ class EnterpriseShieldBotV3_2:
                     time.sleep(0.1)
             self.grid_map = {uid: info for uid, info in self.grid_map.items() if info['side'] == 'ask'}
             self.save_state()
-            logj("mode_reset_execution", mode=self.current_mode, msg="Grid re-aligned for Active Meat strategy.")
+            logj("mode_reset_execution", mode=self.current_mode, msg="Grid re-aligned.")
 
     def maintain_grid(self):
         try:
@@ -270,7 +274,7 @@ class EnterpriseShieldBotV3_2:
 
     def run(self):
         total_asset = self.get_total_asset()
-        logj("bot_start", v="3.2 ActiveMeat", base_asset=format(int(total_asset), ','))
+        logj("bot_start", v="3.2.1 Robust", base_asset=format(int(total_asset), ','))
 
         wm = WebSocketManager("ticker", [SYMBOL])
         last_loop_time = 0
@@ -304,4 +308,4 @@ class EnterpriseShieldBotV3_2:
                 time.sleep(2)
 
 if __name__ == "__main__":
-    EnterpriseShieldBotV3_2().run()
+    EnterpriseShieldBotV3_2_1().run()
