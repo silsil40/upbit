@@ -29,7 +29,7 @@ UPBIT_ACCESS_KEY = os.getenv("UPBIT_ACCESS_KEY", "po04aXLppNilEDtmtkMVGMcL2VaaQT
 UPBIT_SECRET_KEY = os.getenv("UPBIT_SECRET_KEY", "6Yi02ssfxbXYzpOFlazpEjinLa6AVq3960lpxEzJ")
 
 SYMBOL           = "KRW-SOL"
-BUY_AMOUNT_KRW   = Decimal("250000") # 슬롯당 25만 원
+BUY_AMOUNT_KRW   = Decimal("300000") # 슬롯당 30만 원
 BASE_GRID_GAP    = Decimal("0.003") # 0.3%
 PROFIT_PCT       = Decimal("0.005") # 0.5%
 
