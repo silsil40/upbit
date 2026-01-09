@@ -3,10 +3,11 @@
 """
 [KRW-SOL Active Meat v3.2.2 - 전략 명세서]
 
-1. 로컬 메모리 우선(Local-First): 업비트 API보다 봇의 내부 수첩(grid_map)을 우선 신뢰하여 중복 주문 원천 차단
-2. 주기적 정합성 체크(Reconciliation): 1분 주기로 실제 거래소 주문과 수첩을 대조하여 '좀비 주문' 및 '뒤틀린 그리드' 강제 교정
-3. 150원 지터 필터(Hysteresis): 가격이 150원(1.5틱) 이상 유의미하게 변할 때만 주문을 재배치하여 API 난사 방지
-4. 원자적 리셋(Atomic Reset): 취소와 생성 사이에 0.5초의 쿨타임을 두어 분산 시스템 간의 상태 정합성 보장
+1. Atomic Sync (재진입 가능 락): threading.RLock을 도입하여 그리드 교정 시 발생하는 데드락 완전 방지
+2. 로컬 수첩 우선(Local-First): 업비트 API 응답 지연에 휘둘리지 않고 봇의 내부 수첩(grid_map)을 최우선 신뢰
+3. 1분 주기 정합성 체크(Reconciliation): 거래소와 수첩을 60초마다 대조하여 좀비 주문 및 수동 조작 자동 보정
+4. 150원 지터 필터(Hysteresis): 호가 단위(100원) 노이즈로 인한 API 난사 방지 (2틱 이상 움직일 때만 재배치)
+5. 공격적 하방 커버: 슬롯당 30만 원 증액, -20% 낙폭까지 촘촘하게 매수하여 반등 수익 극대화
 """
 
 import os
@@ -20,6 +21,7 @@ from collections import deque
 import pyupbit
 from pyupbit import WebSocketManager
 
+# 고정밀 연산을 위한 컨텍스트 설정
 getcontext().prec = 28
 
 # ==========================================
@@ -29,9 +31,9 @@ UPBIT_ACCESS_KEY = os.getenv("UPBIT_ACCESS_KEY", "po04aXLppNilEDtmtkMVGMcL2VaaQT
 UPBIT_SECRET_KEY = os.getenv("UPBIT_SECRET_KEY", "6Yi02ssfxbXYzpOFlazpEjinLa6AVq3960lpxEzJ")
 
 SYMBOL           = "KRW-SOL"
-BUY_AMOUNT_KRW   = Decimal("300000") # 슬롯당 30만 원
-BASE_GRID_GAP    = Decimal("0.003") # 0.3%
-PROFIT_PCT       = Decimal("0.005") # 0.5%
+BUY_AMOUNT_KRW   = Decimal("300000") # 슬롯당 30만 원으로 증액
+BASE_GRID_GAP    = Decimal("0.003")  # 0.3%
+PROFIT_PCT       = Decimal("0.005")  # 0.5%
 
 # --- [리스크 판단 엔진 설정] ---
 VP_WINDOW_SEC      = 1800           # 분석 범위: 30분
@@ -65,7 +67,8 @@ def adjust_price(price):
 class EnterpriseShieldBotV3_2_2:
     def __init__(self):
         self.upbit = pyupbit.Upbit(UPBIT_ACCESS_KEY, UPBIT_SECRET_KEY)
-        self.lock = threading.Lock()
+        # [수정] threading.Lock 대신 재진입이 가능한 RLock 사용 (자바의 ReentrantLock과 동일)
+        self.lock = threading.RLock()
         self.grid_map = {}
         self.current_price = Decimal("0")
         
@@ -73,7 +76,7 @@ class EnterpriseShieldBotV3_2_2:
         self.last_mode = "NORMAL"
         self.rolling_24h_high = Decimal("0")
         self.last_high_update = 0
-        self.last_reconcile_time = 0 # 정합성 체크 주기 관리
+        self.last_reconcile_time = 0 
         self.trade_history = deque() 
         self.cumulative_net_profit = Decimal("0")
         
@@ -89,7 +92,7 @@ class EnterpriseShieldBotV3_2_2:
                         'buy_price': Decimal(info['buy_price']),
                         'sell_price': Decimal(info['sell_price']),
                         'side': info['side'],
-                        'timestamp': info.get('timestamp', time.time()) # 생성 시각 추적
+                        'timestamp': info.get('timestamp', time.time())
                     }
             logj("state_loaded", count=len(self.grid_map))
         except Exception:
@@ -113,7 +116,7 @@ class EnterpriseShieldBotV3_2_2:
             logj("err_save", trace=traceback.format_exc())
 
     def reconcile_orders(self):
-        """[핵심] 1분마다 거래소와 수첩의 싱크를 맞춤 (Conflict Resolution)"""
+        """[핵심] 1분마다 거래소와 수첩의 싱크를 맞춤"""
         if time.time() - self.last_reconcile_time < 60: return
         try:
             actual_orders = self.upbit.get_order(SYMBOL, state='wait') or []
@@ -121,19 +124,17 @@ class EnterpriseShieldBotV3_2_2:
             now = time.time()
 
             with self.lock:
-                # 1. 수첩(Memory) -> 거래소(API) 대조: 체결/취소된 좀비 제거
+                # 1. 수첩 -> 거래소 대조 (좀비 제거)
                 to_delete = []
                 for uid, info in self.grid_map.items():
-                    # 방금 주문한 건(15초 이내)은 전송 지연 가능성이 크므로 대조 제외
                     if uid not in actual_uuids and (now - info.get('timestamp', 0) > 15):
-                        if info['side'] == 'bid': # 매수는 리스트에 없으면 확실히 삭제
-                            to_delete.append(uid)
+                        if info['side'] == 'bid': to_delete.append(uid)
                 
                 for uid in to_delete:
                     del self.grid_map[uid]
                     logj("sync_removed", uid=uid, msg="Local order pruned after API check.")
 
-                # 2. 거래소(API) -> 수첩(Memory) 대조: 누락된 주문 복구
+                # 2. 거래소 -> 수첩 대조 (누락 복구)
                 for o in actual_orders:
                     uid = o['uuid']
                     if uid not in self.grid_map:
@@ -149,7 +150,7 @@ class EnterpriseShieldBotV3_2_2:
             
             self.last_reconcile_time = now
             self.save_state()
-        except:
+        except Exception:
             logj("err_reconcile", trace=traceback.format_exc())
 
     def update_24h_high(self):
@@ -175,21 +176,21 @@ class EnterpriseShieldBotV3_2_2:
     def decide_mode(self):
         if self.rolling_24h_high == 0: return "NORMAL"
         mdd = (self.current_price - self.rolling_24h_high) / self.rolling_24h_high
-        v_power = self.get_volume_power()
-        if mdd <= FREEZE_MDD or v_power < FREEZE_VP: return "FREEZE"
-        if mdd <= DEFENSIVE_MDD or v_power < DEFENSIVE_VP: return "DEFENSIVE"
-        if mdd <= CAUTION_MDD or v_power < CAUTION_VP: return "CAUTION"
+        vp = self.get_volume_power()
+        if mdd <= FREEZE_MDD or vp < FREEZE_VP: return "FREEZE"
+        if mdd <= DEFENSIVE_MDD or vp < DEFENSIVE_VP: return "DEFENSIVE"
+        if mdd <= CAUTION_MDD or vp < CAUTION_VP: return "CAUTION"
         return "NORMAL"
 
     def reset_buy_grid(self):
-        """모드 전환 시 원자적 리셋: 전체 취소 후 수첩 초기화"""
+        """모드 전환 및 그리드 교정 시 원자적 리셋 (데드락 안전 버전)"""
         with self.lock:
             orders = self.upbit.get_order(SYMBOL, state='wait') or []
             for o in orders:
                 if o['side'] == 'bid':
                     self.upbit.cancel_order(o['uuid'])
                     if o['uuid'] in self.grid_map: del self.grid_map[o['uuid']]
-            time.sleep(0.5) # API 동기화 쿨타임
+            time.sleep(0.5) 
             self.save_state()
             logj("mode_reset_execution", mode=self.current_mode)
 
@@ -205,15 +206,14 @@ class EnterpriseShieldBotV3_2_2:
                 buy_infos = sorted([i for i in self.grid_map.values() if i['side'] == 'bid'], 
                                    key=lambda x: x['buy_price'], reverse=True)
                 
-                # 2. 150원 유격(Hysteresis) 기반 Shift-Up 판단
+                # 2. 150원 유격(Hysteresis) 기반 그리드 정렬 판단
                 if buy_infos:
                     highest_buy = buy_infos[0]['buy_price']
                     target_1st = adjust_price(self.current_price * (Decimal("1") - current_gap))
                     
-                    # 목표가와 실제주문가의 오차가 150원을 넘을 때만 재배치 (API 난사 방지)
                     if abs(highest_buy - target_1st) > 150:
                         logj("grid_realign", current=str(highest_buy), target=str(target_1st), diff=str(highest_buy - target_1st))
-                        self.reset_buy_grid()
+                        self.reset_buy_grid() # RLock 덕분에 데드락 없이 호출 가능
                         return
 
                 # 3. 설계도 기반 주문 생성 (Price-Level Lock)
@@ -222,11 +222,9 @@ class EnterpriseShieldBotV3_2_2:
                 for i in range(1, MAX_LAYERS + 1):
                     target_p = adjust_price(self.current_price * (Decimal("1") - current_gap * i))
                     
-                    # 중복 가격 체크: 수첩에 100원 이내로 붙은 주문이 있으면 절대 추가 안 함
                     if any(abs(p - target_p) <= 100 for p in existing_prices):
                         continue
 
-                    # 최대 레이어 제한 확인
                     if len([i for i in self.grid_map.values() if i['side'] == 'bid']) < MAX_LAYERS:
                         balance = Decimal(str(self.upbit.get_balance("KRW")))
                         if balance < (BUY_AMOUNT_KRW * Decimal("1.0005")): break
@@ -234,7 +232,6 @@ class EnterpriseShieldBotV3_2_2:
                         vol = BUY_AMOUNT_KRW / target_p
                         res = self.upbit.buy_limit_order(SYMBOL, float(target_p), float(vol))
                         if res and 'uuid' in res:
-                            # 주문 즉시 수첩에 기록 (Optimistic Update)
                             self.grid_map[res['uuid']] = {
                                 'buy_price': target_p, 
                                 'sell_price': adjust_price(target_p * (Decimal("1") + PROFIT_PCT)),
@@ -243,7 +240,7 @@ class EnterpriseShieldBotV3_2_2:
                             }
                             logj("place_buy", price=str(target_p), mode=self.current_mode)
                             self.save_state()
-                        time.sleep(0.3) # API 연속 호출 방지
+                        time.sleep(0.3)
         except Exception:
             logj("err_maintain", trace=traceback.format_exc())
 
@@ -298,7 +295,7 @@ class EnterpriseShieldBotV3_2_2:
                 
                 if time.time() - last_loop_time > 4:
                     self.update_24h_high()
-                    self.reconcile_orders() # [추가] 주기적 수첩-현장 대조
+                    self.reconcile_orders()
                     self.current_mode = self.decide_mode()
                     
                     if self.current_mode != self.last_mode:
