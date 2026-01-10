@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-[KRW-SOL Active Meat v3.2.5 - Enterprise Shield]
+[KRW-SOL Active Meat v3.2.6 - Asymmetric Anchor]
 
-1. Duplicate Slot Protection: 매수/매도 구분 없이 점유된 가격대(Slot)의 중복 매수를 원천 차단
-2. Hybrid Tracking: 상승 시 최하단 주문을 재활용(Tail-Recycle)하여 그리드 밀착 추적
-3. Atomic Partial Fill Defense: 주문 취소/이동 시 체결 수량을 즉시 확인하여 누락 없는 매도 전환
-4. Orphan Coin Recovery: 1분마다 실제 잔고 대조를 통해 수첩 밖의 고아 코인을 자동 익절 매도
-5. Atomic Sync (RLock): 재진입 가능 락을 통한 멀티 쓰레드 환경 및 중첩 로직 안정성 보장
+1. Asymmetric Realign: 가격 하락 시 리셋을 금지하여 매수 체결 보장 (상승 시에만 추격)
+2. Policy Overriding: 모드 변경(Normal/Caution 등) 시에는 리셋을 허용하여 즉시 정책 반영
+3. Proximity Guard (250원): 200원 이하 근접 주문의 중복 생성을 철저히 차단 (솔라나 2.5틱 기준)
+4. Orphan Recovery: 1분마다 잔고 대조를 통해 미등록 자산(부분 체결분 등) 자동 익절 매도
 """
 
 import os
@@ -64,7 +63,7 @@ def adjust_price(price):
     else: tick = Decimal("1")
     return (p / tick).to_integral_value(rounding='ROUND_FLOOR') * tick
 
-class EnterpriseShieldBotV3_2_5:
+class EnterpriseShieldBotV3_2_6:
     def __init__(self):
         self.upbit = pyupbit.Upbit(UPBIT_ACCESS_KEY, UPBIT_SECRET_KEY)
         self.lock = threading.RLock()
@@ -117,7 +116,7 @@ class EnterpriseShieldBotV3_2_5:
             logj("err_save", trace=traceback.format_exc())
 
     def reconcile_orders(self):
-        """[v3.2.5] 정기 정합성 체크: 고아 코인 구제 + 중복 가격 주문 정리"""
+        """[v3.2.6] 정기 정합성 체크: 비대칭 리셋 로직 적용"""
         if time.time() - self.last_reconcile_time < 60: return
         try:
             actual_orders = self.upbit.get_order(SYMBOL, state='wait') or []
@@ -125,7 +124,7 @@ class EnterpriseShieldBotV3_2_5:
             now = time.time()
 
             with self.lock:
-                # 1. 수첩-API 대조 및 동기화
+                # 1. 수첩-API 동기화
                 to_delete = []
                 for uid, info in self.grid_map.items():
                     if uid not in actual_uuids and (now - info.get('timestamp', 0) > 15):
@@ -144,21 +143,23 @@ class EnterpriseShieldBotV3_2_5:
                             'timestamp': now
                         }
 
-                # 2. 중복 가격 주문 정리 가드
-                price_tracker = {}
-                uids_to_cancel = []
-                for uid, info in list(self.grid_map.items()):
-                    p = info['buy_price']
-                    if p in price_tracker:
-                        uids_to_cancel.append(uid)
+                # 2. [v3.2.6 핵심] 비대칭 리셋 판단
+                buy_infos = sorted([i for i in self.grid_map.values() if i['side'] == 'bid'], 
+                                   key=lambda x: x['buy_price'], reverse=True)
+                if buy_infos:
+                    highest_bid_p = buy_infos[0]['buy_price']
+                    mode_m = {"NORMAL": 1.0, "CAUTION": 2.0, "DEFENSIVE": 3.3, "FREEZE": 999.0}
+                    curr_gap = BASE_GRID_GAP * Decimal(str(mode_m.get(self.current_mode, 1.0)))
+                    target_1st = adjust_price(self.current_price * (Decimal("1") - curr_gap))
+                    
+                    # 상승 추격: 목표가가 기존 최상단 주문보다 높고, 유격이 250원 이상일 때만 리셋
+                    if target_1st > highest_bid_p:
+                        if (target_1st - highest_bid_p) > 250:
+                            logj("periodic_realign_up", current=str(highest_bid_p), target=str(target_1st))
+                            self.reset_buy_grid()
                     else:
-                        price_tracker[p] = uid
-                
-                for uid in uids_to_cancel:
-                    if uid in actual_uuids:
-                        self.upbit.cancel_order(uid)
-                        logj("cleanup_duplicate_price", price=str(self.grid_map[uid]['buy_price']))
-                    if uid in self.grid_map: del self.grid_map[uid]
+                        # 하락 상황: 리셋을 하지 않고 기존 매수 그물을 유지하여 체결을 유도
+                        pass
 
                 # 3. 고아 코인 구제 (잔고 대조)
                 actual_balance = Decimal(str(self.upbit.get_balance(SYMBOL)))
@@ -174,17 +175,6 @@ class EnterpriseShieldBotV3_2_5:
                             'sell_price': target_sell_p,
                             'side': 'ask', 'volume': orphan_vol, 'timestamp': time.time()
                         }
-
-                # 4. 정기 Full Re-align
-                buy_infos = sorted([i for i in self.grid_map.values() if i['side'] == 'bid'], 
-                                   key=lambda x: x['buy_price'], reverse=True)
-                if buy_infos:
-                    mode_m = {"NORMAL": 1.0, "CAUTION": 2.0, "DEFENSIVE": 3.3, "FREEZE": 999.0}
-                    curr_gap = BASE_GRID_GAP * Decimal(str(mode_m.get(self.current_mode, 1.0)))
-                    target_1st = adjust_price(self.current_price * (Decimal("1") - curr_gap))
-                    if abs(buy_infos[0]['buy_price'] - target_1st) > 150:
-                        logj("periodic_realign")
-                        self.reset_buy_grid()
             
             self.last_reconcile_time = now
             self.save_state()
@@ -213,10 +203,9 @@ class EnterpriseShieldBotV3_2_5:
                     if uuid in self.grid_map: del self.grid_map[uuid]
             time.sleep(0.3) 
             self.save_state()
-            logj("mode_reset_execution", mode=self.current_mode)
 
     def maintain_grid(self):
-        """[v3.2.5] 상시 추격: 꼬리 재활용 및 중복 가격대 방어"""
+        """[v3.2.6] 상시 추격: 250원 중복 방어 및 빈 슬롯 보충"""
         try:
             mode_m = {"NORMAL": 1.0, "CAUTION": 2.0, "DEFENSIVE": 3.3, "FREEZE": 999.0}
             current_gap = BASE_GRID_GAP * Decimal(str(mode_m.get(self.current_mode, 1.0)))
@@ -247,18 +236,17 @@ class EnterpriseShieldBotV3_2_5:
                         if lowest_uid in self.grid_map: del self.grid_map[lowest_uid]
                         logj("shift_up_single")
 
-                # 2. [v3.2.5] 중복 방지 매수 신규 주문
-                # 이미 체결되어 매도 대기(ask) 중인 가격까지 점유 상태로 간주
+                # 2. [v3.2.6] 250원 세이프존 기반 신규 주문
                 occupied_prices = [i['buy_price'] for i in self.grid_map.values()]
                 current_bid_count = len([i for i in self.grid_map.values() if i['side'] == 'bid'])
 
                 for i in range(1, MAX_LAYERS + 1):
                     target_p = adjust_price(self.current_price * (Decimal("1") - current_gap * i))
                     
-                    # 수첩에 어떤 상태로든 이 가격이 있으면 건너뜀
-                    if any(abs(p - target_p) <= 150 for p in occupied_prices): continue
+                    # 250원 이내 근접 주문이 있으면 절대 생성 안 함 (중복 방지)
+                    if any(abs(p - target_p) <= 250 for p in occupied_prices): continue
 
-                    # 매수 대기 슬롯 가용성 확인
+                    # 매수 주문 부족 시에만 순차적으로 보충 (하락 시 자연스럽게 10번 이상 사짐)
                     if current_bid_count < MAX_LAYERS:
                         balance = Decimal(str(self.upbit.get_balance("KRW")))
                         if balance < (BUY_AMOUNT_KRW * Decimal("1.0005")): break
@@ -338,7 +326,7 @@ class EnterpriseShieldBotV3_2_5:
         return "NORMAL"
 
     def run(self):
-        logj("bot_start", v="3.2.5 EnterpriseShield")
+        logj("bot_start", v="3.2.6 AsymmetricAnchor")
         wm = WebSocketManager("ticker", [SYMBOL])
         last_loop_time = 0
         while True:
@@ -351,10 +339,14 @@ class EnterpriseShieldBotV3_2_5:
                 if time.time() - last_loop_time > 4:
                     self.update_24h_high()
                     self.reconcile_orders()
+                    
+                    # [v3.2.6 모드 변경 리셋] 정책 변화 시에는 하락 중이라도 리셋하여 정책 반영
                     self.current_mode = self.decide_mode()
                     if self.current_mode != self.last_mode:
+                        logj("mode_change_reset", prev=self.last_mode, curr=self.current_mode)
                         self.reset_buy_grid()
                         self.last_mode = self.current_mode
+                        
                     self.maintain_grid()
                     self.check_fill()
                     mdd_val = (self.current_price - self.rolling_24h_high) / self.rolling_24h_high if self.rolling_24h_high > 0 else 0
@@ -366,4 +358,4 @@ class EnterpriseShieldBotV3_2_5:
                 time.sleep(2)
 
 if __name__ == "__main__":
-    EnterpriseShieldBotV3_2_5().run()
+    EnterpriseShieldBotV3_2_6().run()
