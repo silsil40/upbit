@@ -8,6 +8,7 @@
 3. Orphan Sniper (3%): 지갑 내 고아 코인 감지 시, 발견가 대비 3% 상승하면 자동 익절 매도
 4. Ghost Data Filter: 기동 시 볼륨 0인 쓰레기 데이터를 자동 삭제하여 정합성 유지
 5. Proximity Guard (250원): 200원 이하 근접 주문 중복 생성 방지
+6. [Hotfix] Race Condition 방어: reconcile_orders에서 매수(bid) 주문 강제 삭제 로직 제거
 """
 
 import os
@@ -88,7 +89,6 @@ class EnterpriseShieldBotV3_2_8:
                 raw_map = json.load(f)
                 for uid, info in raw_map.items():
                     vol = Decimal(info.get('volume', '0'))
-                    # [v3.2.8] 볼륨이 0인 무효 데이터 로드 차단
                     if vol <= 0: continue
                     
                     self.grid_map[uid] = {
@@ -129,20 +129,27 @@ class EnterpriseShieldBotV3_2_8:
             now = time.time()
 
             with self.lock:
-                # 1. 수첩 정화 (미체결 목록에 없는 매수 주문 제거)
+                # 1. 수첩 정화 (미체결 목록에 없는 매도 주문만 제거)
                 to_delete = []
                 for uid, info in self.grid_map.items():
                     if uid not in actual_uuids and (now - info.get('timestamp', 0) > 20):
-                        if info['side'] == 'bid': to_delete.append(uid)
+                        # [수정안 A 반영] 매수(bid) 주문은 여기서 지우지 않음. 
+                        # 체결된 찰나에 사라진 것일 수 있으므로 check_fill이나 Orphan Sniper에 위임.
+                        if info['side'] == 'bid':
+                            continue
+                        
+                        # 매도(ask) 주문이 미체결 목록에 없다면 이미 완료된 것이므로 삭제.
+                        if info['side'] == 'ask':
+                            to_delete.append(uid)
+                            
                 for uid in to_delete: del self.grid_map[uid]
                 
-                # 2. Reverse Sync: 업비트의 실제 주문을 수첩에 자동 복원
+                # 2. Reverse Sync: 업비트 실제 주문을 수첩에 자동 복원
                 for o in actual_orders:
                     if o['uuid'] not in self.grid_map:
                         p = Decimal(str(o['price']))
                         v = Decimal(str(o['remaining_volume']))
                         side = 'bid' if o['side'] == 'bid' else 'ask'
-                        # 매수가 역산 기록
                         buy_p = p if side == 'bid' else adjust_price(p / (Decimal("1") + PROFIT_PCT))
                         
                         self.grid_map[o['uuid']] = {
@@ -171,14 +178,11 @@ class EnterpriseShieldBotV3_2_8:
                 orphan_vol = actual_balance - tracked_sell_vol
                 
                 if orphan_vol > Decimal("0.02"):
-                    # 최초 발견 시 기준가 설정
                     if self.orphan_baseline is None:
                         self.orphan_baseline = self.current_price
                         logj("orphan_found_anchor", vol=str(orphan_vol), anchor_price=str(self.orphan_baseline))
                     
-                    # 기준가 대비 3% 상승 체크
                     target_3pct_p = adjust_price(self.orphan_baseline * Decimal("1.03"))
-                    
                     if self.current_price >= target_3pct_p:
                         logj("orphan_sniper_execute", vol=str(orphan_vol), exit_price=str(self.current_price))
                         res = self.upbit.sell_limit_order(SYMBOL, float(self.current_price), float(orphan_vol))
@@ -187,7 +191,7 @@ class EnterpriseShieldBotV3_2_8:
                                 'buy_price': self.orphan_baseline, 'sell_price': self.current_price,
                                 'side': 'ask', 'volume': orphan_vol, 'timestamp': time.time()
                             }
-                            self.orphan_baseline = None # 탈출 완료 후 초기화
+                            self.orphan_baseline = None
                     else:
                         logj("orphan_monitoring", vol=str(orphan_vol), anchor=str(self.orphan_baseline), target=str(target_3pct_p))
                 else:
@@ -321,6 +325,7 @@ class EnterpriseShieldBotV3_2_8:
             self.trade_history.popleft()
         buy_vol = sum(vol for ts, vol, side in self.trade_history if side == 'BID')
         sell_vol = sum(vol for ts, vol, side in self.trade_history if side == 'ASK')
+        if self.current_price == 0: return Decimal("100.0")
         total_vol_krw = (Decimal(str(buy_vol)) + Decimal(str(sell_vol))) * self.current_price
         if total_vol_krw < MIN_TOTAL_VOL_KRW: return Decimal("100.0")
         if sell_vol == 0: return Decimal("100.0")
@@ -336,7 +341,7 @@ class EnterpriseShieldBotV3_2_8:
         return "NORMAL"
 
     def run(self):
-        logj("bot_start", v="3.2.8 OrphanSniper")
+        logj("bot_start", v="3.2.8.Hotfixed")
         wm = WebSocketManager("ticker", [SYMBOL])
         last_loop_time = 0
         while True:
