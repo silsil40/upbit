@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-[KRW-SOL Active Meat v3.2.9 - Stats & Proximity]
+[KRW-SOL Active Meat v3.3.0 - Count Guard]
 
 1. Asymmetric Anchor: 하락 시 리셋 금지, 상승 시에만 추격
 2. Reverse Sync: 수첩 유실 시 업비트 실제 주문을 수첩(JSON)에 자동 복원
@@ -9,6 +9,9 @@
 4. Ghost Data Filter: 기동 시 볼륨 0인 쓰레기 데이터를 자동 삭제하여 정합성 유지
 5. Proximity Guard (350원): 350원 이하 근접 주문 중복 생성 방지 (최소 400원 간격 확보)
 6. Daily Sales Log: 하루 동안 완료된 매도(익절) 횟수를 실시간으로 집계 및 출력
+7. Count Guard (70): 미체결 주문 총개수가 MAX_OPEN_ORDERS에 도달하면 신규 매수 중단.
+   매수+매도 합으로 세므로 미체결 매도가 70개를 넘지 않도록 보장. 업비트 실제 주문 기준으로 카운트.
+   매도가 체결되어 개수가 줄면 매수 자동 재개.
 """
 
 import os
@@ -27,13 +30,17 @@ getcontext().prec = 28
 # ==========================================
 # [사용자 설정 영역] - Config
 # ==========================================
-UPBIT_ACCESS_KEY = os.getenv("UPBIT_ACCESS_KEY", "po04aXLppNilEDtmtkMVGMcL2VaaQTSU4aIy8xLy")
-UPBIT_SECRET_KEY = os.getenv("UPBIT_SECRET_KEY", "6Yi02ssfxbXYzpOFlazpEjinLa6AVq3960lpxEzJ")
+# ⚠️ 키를 코드에 직접 넣지 마세요. 환경변수로만 주입하세요.
+UPBIT_ACCESS_KEY = os.getenv("UPBIT_ACCESS_KEY", "jSGxSFvCYSyQpyCkTkrBZ6a3NcDq5FehVmtEedag")
+UPBIT_SECRET_KEY = os.getenv("UPBIT_SECRET_KEY", "er4I1xlj3l3jg097cOwN5Fw5Cq3vipMcqyzzBJ0l")
 
 SYMBOL           = "KRW-SOL"
 BUY_AMOUNT_KRW   = Decimal("300000") 
 BASE_GRID_GAP    = Decimal("0.003")  
 PROFIT_PCT       = Decimal("0.005")  
+
+# --- [안전바: 미체결 주문 개수 상한] ---  ★ 추가
+MAX_OPEN_ORDERS  = 70    # 미체결 주문(매수+매도) 총개수 상한. 도달 시 신규 매수 중단
 
 # --- [리스크 판단 엔진 설정] ---
 VP_WINDOW_SEC      = 1800           
@@ -62,7 +69,7 @@ def adjust_price(price):
     else: tick = Decimal("1")
     return (p / tick).to_integral_value(rounding='ROUND_FLOOR') * tick
 
-class EnterpriseShieldBotV3_2_9:
+class EnterpriseShieldBotV3_3_0:
     def __init__(self):
         self.upbit = pyupbit.Upbit(UPBIT_ACCESS_KEY, UPBIT_SECRET_KEY)
         self.lock = threading.RLock()
@@ -213,6 +220,13 @@ class EnterpriseShieldBotV3_2_9:
             current_gap = BASE_GRID_GAP * Decimal(str(mode_m.get(self.current_mode, 1.0)))
             with self.lock:
                 if self.current_mode == "FREEZE": return 
+
+                # ★ [추가] 미체결 주문 총개수 (업비트 실제 기준). 상한 도달 시 신규 매수 중단
+                try:
+                    open_order_count = len(self.upbit.get_order(SYMBOL, state='wait') or [])
+                except Exception:
+                    open_order_count = len(self.grid_map)  # 폴백: 수첩 기준
+
                 buy_infos = sorted([i for i in self.grid_map.items() if i[1]['side'] == 'bid'], 
                                    key=lambda x: x[1]['buy_price'])
                 if len(buy_infos) >= MAX_LAYERS:
@@ -239,6 +253,10 @@ class EnterpriseShieldBotV3_2_9:
                     target_p = adjust_price(self.current_price * (Decimal("1") - current_gap * i))
                     if any(abs(p - target_p) <= 350 for p in occupied_prices): continue
                     if current_bid_count < MAX_LAYERS:
+                        # ★ [추가] 개수 상한 가드: 70개 도달 시 신규 매수 중단
+                        if open_order_count >= MAX_OPEN_ORDERS:
+                            logj("order_count_capped", count=open_order_count, cap=MAX_OPEN_ORDERS)
+                            break
                         balance = Decimal(str(self.upbit.get_balance("KRW")))
                         if balance < (BUY_AMOUNT_KRW * Decimal("1.0005")): break
                         vol = BUY_AMOUNT_KRW / target_p
@@ -250,6 +268,7 @@ class EnterpriseShieldBotV3_2_9:
                             }
                             logj("place_buy", price=str(target_p))
                             current_bid_count += 1
+                            open_order_count += 1  # ★ [추가] 방금 건 주문 반영
                             self.save_state()
                         time.sleep(0.3)
         except Exception:
@@ -327,7 +346,7 @@ class EnterpriseShieldBotV3_2_9:
         return "NORMAL"
 
     def run(self):
-        logj("bot_start", v="3.2.9.Stats")
+        logj("bot_start", v="3.3.0.CountGuard")
         wm = WebSocketManager("ticker", [SYMBOL])
         last_loop_time = 0
         while True:
@@ -356,4 +375,4 @@ class EnterpriseShieldBotV3_2_9:
                 time.sleep(2)
 
 if __name__ == "__main__":
-    EnterpriseShieldBotV3_2_9().run()
+    EnterpriseShieldBotV3_3_0().run()
