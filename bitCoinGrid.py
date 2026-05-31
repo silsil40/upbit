@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-[KRW-SOL Active Meat v3.3.0 - Count Guard]
+[KRW-SOL Active Meat v3.3.1 - Gap 0.4% + Proximity Fix]
 
+v3.3.0(Count Guard) 대비 변경점:
+ - BASE_GRID_GAP 0.003 → 0.004 (현재가 ~125,000 기준 약 500원 간격)
+ - 근접가드 허점 수정: 같은 maintain_grid 루프에서 방금 배치한 주문도
+   즉시 occupied_prices에 반영하도록 변경. (이전엔 루프 시작 전 목록만 비교해서,
+   같은 사이클에 인접 레벨이 동시에 들어가면 300원 간격이 새어나갔음)
+ - PROXIMITY_KRW 상수화(기본 350원). 이 값보다 가까운 신규 매수는 생성 안 함
+   → 최소 ~400원 간격 바닥 보장(틱100 기준).
+
+[기존 유지 기능]
 1. Asymmetric Anchor: 하락 시 리셋 금지, 상승 시에만 추격
 2. Reverse Sync: 수첩 유실 시 업비트 실제 주문을 수첩(JSON)에 자동 복원
 3. Orphan Sniper (3%): 지갑 내 고아 코인 감지 시, 발견가 대비 3% 상승하면 자동 익절 매도
 4. Ghost Data Filter: 기동 시 볼륨 0인 쓰레기 데이터를 자동 삭제하여 정합성 유지
-5. Proximity Guard (350원): 350원 이하 근접 주문 중복 생성 방지 (최소 400원 간격 확보)
-6. Daily Sales Log: 하루 동안 완료된 매도(익절) 횟수를 실시간으로 집계 및 출력
-7. Count Guard (70): 미체결 주문 총개수가 MAX_OPEN_ORDERS에 도달하면 신규 매수 중단.
-   매수+매도 합으로 세므로 미체결 매도가 70개를 넘지 않도록 보장. 업비트 실제 주문 기준으로 카운트.
-   매도가 체결되어 개수가 줄면 매수 자동 재개.
+5. Proximity Guard: 근접가드(아래 PROXIMITY_KRW) 이하 중복 주문 방지
+6. Daily Sales Log: 하루 동안 완료된 매도(익절) 횟수를 실시간 집계/출력
+7. Count Guard (70): 미체결 주문 총개수가 MAX_OPEN_ORDERS 도달 시 신규 매수 중단
 """
 
 import os
@@ -35,16 +42,19 @@ UPBIT_ACCESS_KEY = os.getenv("UPBIT_ACCESS_KEY", "jSGxSFvCYSyQpyCkTkrBZ6a3NcDq5F
 UPBIT_SECRET_KEY = os.getenv("UPBIT_SECRET_KEY", "er4I1xlj3l3jg097cOwN5Fw5Cq3vipMcqyzzBJ0l")
 
 SYMBOL           = "KRW-SOL"
-BUY_AMOUNT_KRW   = Decimal("300000") 
-BASE_GRID_GAP    = Decimal("0.003")  
-PROFIT_PCT       = Decimal("0.005")  
+BUY_AMOUNT_KRW   = Decimal("300000")
+BASE_GRID_GAP    = Decimal("0.004")   # ★ 0.003→0.004 (현재가 ~125,000 기준 약 500원)
+PROFIT_PCT       = Decimal("0.005")
 
-# --- [안전바: 미체결 주문 개수 상한] ---  ★ 추가
+# --- [근접가드: 이 금액 이하로 가까운 신규 매수는 생성 안 함] ---  ★ 상수화
+PROXIMITY_KRW    = Decimal("350")     # 350원 이내 중복 방지 → 최소 ~400원 간격 바닥
+
+# --- [안전바: 미체결 주문 개수 상한] ---
 MAX_OPEN_ORDERS  = 70    # 미체결 주문(매수+매도) 총개수 상한. 도달 시 신규 매수 중단
 
 # --- [리스크 판단 엔진 설정] ---
-VP_WINDOW_SEC      = 1800           
-MIN_TOTAL_VOL_KRW  = 1000000000     
+VP_WINDOW_SEC      = 1800
+MIN_TOTAL_VOL_KRW  = 1000000000
 
 CAUTION_MDD      = Decimal("-0.05")
 CAUTION_VP       = Decimal("40.0")
@@ -69,25 +79,25 @@ def adjust_price(price):
     else: tick = Decimal("1")
     return (p / tick).to_integral_value(rounding='ROUND_FLOOR') * tick
 
-class EnterpriseShieldBotV3_3_0:
+class EnterpriseShieldBotV3_3_1:
     def __init__(self):
         self.upbit = pyupbit.Upbit(UPBIT_ACCESS_KEY, UPBIT_SECRET_KEY)
         self.lock = threading.RLock()
         self.grid_map = {}
         self.current_price = Decimal("0")
-        
+
         self.current_mode = "NORMAL"
         self.last_mode = "NORMAL"
         self.rolling_24h_high = Decimal("0")
         self.last_high_update = 0
-        self.last_reconcile_time = 0 
-        self.trade_history = deque() 
+        self.last_reconcile_time = 0
+        self.trade_history = deque()
         self.cumulative_net_profit = Decimal("0")
-        
+
         # 일일 매도 카운터 초기화
         self.daily_sale_count = 0
         self.last_sale_date = datetime.now().strftime("%Y-%m-%d")
-        
+
         self.orphan_baseline = None
         self.load_state()
 
@@ -142,7 +152,7 @@ class EnterpriseShieldBotV3_3_0:
                         if info['side'] == 'bid': continue
                         if info['side'] == 'ask': to_delete.append(uid)
                 for uid in to_delete: del self.grid_map[uid]
-                
+
                 for o in actual_orders:
                     if o['uuid'] not in self.grid_map:
                         p = Decimal(str(o['price']))
@@ -156,20 +166,20 @@ class EnterpriseShieldBotV3_3_0:
                         }
                         logj("self_healing_sync", price=str(p), side=side)
 
-                buy_infos = sorted([i for i in self.grid_map.values() if i['side'] == 'bid'], 
+                buy_infos = sorted([i for i in self.grid_map.values() if i['side'] == 'bid'],
                                    key=lambda x: x['buy_price'], reverse=True)
                 if buy_infos:
                     highest_bid_p = buy_infos[0]['buy_price']
                     mode_m = {"NORMAL": 1.0, "CAUTION": 2.0, "DEFENSIVE": 3.3, "FREEZE": 999.0}
                     target_1st = adjust_price(self.current_price * (Decimal("1") - BASE_GRID_GAP * Decimal(str(mode_m.get(self.current_mode, 1.0)))))
-                    if target_1st > highest_bid_p and (target_1st - highest_bid_p) > 350:
+                    if target_1st > highest_bid_p and (target_1st - highest_bid_p) > PROXIMITY_KRW:
                         logj("periodic_realign_up", current=str(highest_bid_p), target=str(target_1st))
                         self.reset_buy_grid()
 
                 actual_balance = Decimal(str(self.upbit.get_balance(SYMBOL)))
                 tracked_sell_vol = sum(info['volume'] for info in self.grid_map.values() if info['side'] == 'ask')
                 orphan_vol = actual_balance - tracked_sell_vol
-                
+
                 if orphan_vol > Decimal("0.02"):
                     if self.orphan_baseline is None:
                         self.orphan_baseline = self.current_price
@@ -211,7 +221,7 @@ class EnterpriseShieldBotV3_3_0:
                                 'side': 'ask', 'volume': exec_vol, 'timestamp': time.time()
                             }
                     if uuid in self.grid_map: del self.grid_map[uuid]
-            time.sleep(0.3) 
+            time.sleep(0.3)
             self.save_state()
 
     def maintain_grid(self):
@@ -219,15 +229,15 @@ class EnterpriseShieldBotV3_3_0:
             mode_m = {"NORMAL": 1.0, "CAUTION": 2.0, "DEFENSIVE": 3.3, "FREEZE": 999.0}
             current_gap = BASE_GRID_GAP * Decimal(str(mode_m.get(self.current_mode, 1.0)))
             with self.lock:
-                if self.current_mode == "FREEZE": return 
+                if self.current_mode == "FREEZE": return
 
-                # ★ [추가] 미체결 주문 총개수 (업비트 실제 기준). 상한 도달 시 신규 매수 중단
+                # 미체결 주문 총개수 (업비트 실제 기준). 상한 도달 시 신규 매수 중단
                 try:
                     open_order_count = len(self.upbit.get_order(SYMBOL, state='wait') or [])
                 except Exception:
                     open_order_count = len(self.grid_map)  # 폴백: 수첩 기준
 
-                buy_infos = sorted([i for i in self.grid_map.items() if i[1]['side'] == 'bid'], 
+                buy_infos = sorted([i for i in self.grid_map.items() if i[1]['side'] == 'bid'],
                                    key=lambda x: x[1]['buy_price'])
                 if len(buy_infos) >= MAX_LAYERS:
                     highest_buy = buy_infos[-1][1]['buy_price']
@@ -251,9 +261,10 @@ class EnterpriseShieldBotV3_3_0:
                 current_bid_count = len([i for i in self.grid_map.values() if i['side'] == 'bid'])
                 for i in range(1, MAX_LAYERS + 1):
                     target_p = adjust_price(self.current_price * (Decimal("1") - current_gap * i))
-                    if any(abs(p - target_p) <= 350 for p in occupied_prices): continue
+                    # ★ 근접가드: 기존 + "이번 루프에서 방금 배치한" 주문까지 모두 비교
+                    if any(abs(p - target_p) <= PROXIMITY_KRW for p in occupied_prices): continue
                     if current_bid_count < MAX_LAYERS:
-                        # ★ [추가] 개수 상한 가드: 70개 도달 시 신규 매수 중단
+                        # 개수 상한 가드: 70개 도달 시 신규 매수 중단
                         if open_order_count >= MAX_OPEN_ORDERS:
                             logj("order_count_capped", count=open_order_count, cap=MAX_OPEN_ORDERS)
                             break
@@ -268,7 +279,8 @@ class EnterpriseShieldBotV3_3_0:
                             }
                             logj("place_buy", price=str(target_p))
                             current_bid_count += 1
-                            open_order_count += 1  # ★ [추가] 방금 건 주문 반영
+                            open_order_count += 1
+                            occupied_prices.append(target_p)   # ★ FIX: 같은 루프 내 중복/근접 방지
                             self.save_state()
                         time.sleep(0.3)
         except Exception:
@@ -295,7 +307,7 @@ class EnterpriseShieldBotV3_3_0:
                             if s_res:
                                 del self.grid_map[uid]
                                 self.grid_map[s_res['uuid']] = {
-                                    'buy_price': info['buy_price'], 'sell_price': info['sell_price'], 
+                                    'buy_price': info['buy_price'], 'sell_price': info['sell_price'],
                                     'side': 'ask', 'volume': vol, 'timestamp': time.time()
                                 }
                                 logj("place_sell", price=str(info['sell_price']))
@@ -306,7 +318,7 @@ class EnterpriseShieldBotV3_3_0:
                             self.daily_sale_count += 1
                             net = (Decimal(str(o['price'])) * vol * Decimal("0.9995")) - (info['buy_price'] * vol * Decimal("1.0005"))
                             self.cumulative_net_profit += net
-                            logj("trade_success", profit=str(round(net, 2)), 
+                            logj("trade_success", profit=str(round(net, 2)),
                                  total=str(round(self.cumulative_net_profit, 2)),
                                  daily_sales=self.daily_sale_count)
                             if self.current_mode != "NORMAL": self.current_mode = "NORMAL"
@@ -346,7 +358,7 @@ class EnterpriseShieldBotV3_3_0:
         return "NORMAL"
 
     def run(self):
-        logj("bot_start", v="3.3.0.CountGuard")
+        logj("bot_start", v="3.3.1.Gap0.4-ProxFix")
         wm = WebSocketManager("ticker", [SYMBOL])
         last_loop_time = 0
         while True:
@@ -366,7 +378,7 @@ class EnterpriseShieldBotV3_3_0:
                     self.maintain_grid()
                     self.check_fill()
                     mdd_val = (self.current_price - self.rolling_24h_high) / self.rolling_24h_high if self.rolling_24h_high > 0 else 0
-                    logj("status", mode=self.current_mode, price=format(int(self.current_price), ','), 
+                    logj("status", mode=self.current_mode, price=format(int(self.current_price), ','),
                          mdd=f"{round(mdd_val*100, 2)}%", v_power=f"{round(self.get_volume_power(), 1)}%",
                          daily_sales=self.daily_sale_count)
                     last_loop_time = time.time()
@@ -375,4 +387,4 @@ class EnterpriseShieldBotV3_3_0:
                 time.sleep(2)
 
 if __name__ == "__main__":
-    EnterpriseShieldBotV3_3_0().run()
+    EnterpriseShieldBotV3_3_1().run()
