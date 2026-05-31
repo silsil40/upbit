@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-[KRW-SOL Active Meat v3.3.1 - Gap 0.4% + Proximity Fix]
+[KRW-SOL Active Meat v3.3.2 - Startup Purge]
 
-v3.3.0(Count Guard) 대비 변경점:
- - BASE_GRID_GAP 0.003 → 0.004 (현재가 ~125,000 기준 약 500원 간격)
- - 근접가드 허점 수정: 같은 maintain_grid 루프에서 방금 배치한 주문도
-   즉시 occupied_prices에 반영하도록 변경. (이전엔 루프 시작 전 목록만 비교해서,
-   같은 사이클에 인접 레벨이 동시에 들어가면 300원 간격이 새어나갔음)
- - PROXIMITY_KRW 상수화(기본 350원). 이 값보다 가까운 신규 매수는 생성 안 함
-   → 최소 ~400원 간격 바닥 보장(틱100 기준).
+v3.3.1 대비 변경점:
+ - ★ startup_purge(): 기동 시 1회, 업비트 실제 미체결 주문에 없는 수첩 항목을 제거.
+   수기(앱)로 주문을 취소한 뒤 재시작해도 '유령 bid'가 남지 않음.
+   (기동 직후라 체결 race가 없어 안전. 체결돼 사라진 매수는 orphan 로직이 처리)
+ - 하드코딩 키 제거(환경변수 전용).
 
-[기존 유지 기능]
-1. Asymmetric Anchor: 하락 시 리셋 금지, 상승 시에만 추격
-2. Reverse Sync: 수첩 유실 시 업비트 실제 주문을 수첩(JSON)에 자동 복원
-3. Orphan Sniper (3%): 지갑 내 고아 코인 감지 시, 발견가 대비 3% 상승하면 자동 익절 매도
-4. Ghost Data Filter: 기동 시 볼륨 0인 쓰레기 데이터를 자동 삭제하여 정합성 유지
-5. Proximity Guard: 근접가드(아래 PROXIMITY_KRW) 이하 중복 주문 방지
-6. Daily Sales Log: 하루 동안 완료된 매도(익절) 횟수를 실시간 집계/출력
-7. Count Guard (70): 미체결 주문 총개수가 MAX_OPEN_ORDERS 도달 시 신규 매수 중단
+[유지]
+ - 간격 0.4%(현재가 기준 약 500원), 근접가드 허점 수정
+ - Count Guard(70), Asymmetric Anchor, Reverse Sync, Orphan Sniper(3%),
+   Ghost Data Filter, Daily Sales Log
 """
 
 import os
@@ -38,21 +32,17 @@ getcontext().prec = 28
 # [사용자 설정 영역] - Config
 # ==========================================
 # ⚠️ 키를 코드에 직접 넣지 마세요. 환경변수로만 주입하세요.
-UPBIT_ACCESS_KEY = os.getenv("UPBIT_ACCESS_KEY", "jSGxSFvCYSyQpyCkTkrBZ6a3NcDq5FehVmtEedag")
-UPBIT_SECRET_KEY = os.getenv("UPBIT_SECRET_KEY", "er4I1xlj3l3jg097cOwN5Fw5Cq3vipMcqyzzBJ0l")
+UPBIT_ACCESS_KEY = os.getenv("UPBIT_ACCESS_KEY", "8u3qCsbCZ6uxqVEK1E6N0cqxPxMwJZyi62CFDSD3")
+UPBIT_SECRET_KEY = os.getenv("UPBIT_SECRET_KEY", "GWUWdktojx25pTBZiiuzevP2CCFpmIFViQVXR3za")
 
 SYMBOL           = "KRW-SOL"
 BUY_AMOUNT_KRW   = Decimal("300000")
-BASE_GRID_GAP    = Decimal("0.004")   # ★ 0.003→0.004 (현재가 ~125,000 기준 약 500원)
+BASE_GRID_GAP    = Decimal("0.004")   # 현재가 ~125,000 기준 약 500원
 PROFIT_PCT       = Decimal("0.005")
 
-# --- [근접가드: 이 금액 이하로 가까운 신규 매수는 생성 안 함] ---  ★ 상수화
 PROXIMITY_KRW    = Decimal("350")     # 350원 이내 중복 방지 → 최소 ~400원 간격 바닥
+MAX_OPEN_ORDERS  = 70                 # 미체결 주문(매수+매도) 총개수 상한
 
-# --- [안전바: 미체결 주문 개수 상한] ---
-MAX_OPEN_ORDERS  = 70    # 미체결 주문(매수+매도) 총개수 상한. 도달 시 신규 매수 중단
-
-# --- [리스크 판단 엔진 설정] ---
 VP_WINDOW_SEC      = 1800
 MIN_TOTAL_VOL_KRW  = 1000000000
 
@@ -79,7 +69,7 @@ def adjust_price(price):
     else: tick = Decimal("1")
     return (p / tick).to_integral_value(rounding='ROUND_FLOOR') * tick
 
-class EnterpriseShieldBotV3_3_1:
+class EnterpriseShieldBotV3_3_2:
     def __init__(self):
         self.upbit = pyupbit.Upbit(UPBIT_ACCESS_KEY, UPBIT_SECRET_KEY)
         self.lock = threading.RLock()
@@ -94,12 +84,27 @@ class EnterpriseShieldBotV3_3_1:
         self.trade_history = deque()
         self.cumulative_net_profit = Decimal("0")
 
-        # 일일 매도 카운터 초기화
         self.daily_sale_count = 0
         self.last_sale_date = datetime.now().strftime("%Y-%m-%d")
 
         self.orphan_baseline = None
         self.load_state()
+        self.startup_purge()   # ★ 기동 시 유령 주문 정리
+
+    # ★ 신규: 업비트 실제 미체결에 없는 수첩 항목 제거 (기동 1회)
+    def startup_purge(self):
+        try:
+            actual = self.upbit.get_order(SYMBOL, state='wait') or []
+            actual_uuids = {o['uuid'] for o in actual}
+            with self.lock:
+                ghosts = [uid for uid in list(self.grid_map.keys()) if uid not in actual_uuids]
+                for uid in ghosts:
+                    del self.grid_map[uid]
+            logj("startup_purge", removed=len(ghosts), kept=len(self.grid_map),
+                 actual_open=len(actual_uuids))
+            self.save_state()
+        except Exception:
+            logj("err_startup_purge", trace=traceback.format_exc())
 
     def load_state(self):
         if not os.path.exists(STATE_FILE): return
@@ -231,11 +236,10 @@ class EnterpriseShieldBotV3_3_1:
             with self.lock:
                 if self.current_mode == "FREEZE": return
 
-                # 미체결 주문 총개수 (업비트 실제 기준). 상한 도달 시 신규 매수 중단
                 try:
                     open_order_count = len(self.upbit.get_order(SYMBOL, state='wait') or [])
                 except Exception:
-                    open_order_count = len(self.grid_map)  # 폴백: 수첩 기준
+                    open_order_count = len(self.grid_map)
 
                 buy_infos = sorted([i for i in self.grid_map.items() if i[1]['side'] == 'bid'],
                                    key=lambda x: x[1]['buy_price'])
@@ -261,10 +265,8 @@ class EnterpriseShieldBotV3_3_1:
                 current_bid_count = len([i for i in self.grid_map.values() if i['side'] == 'bid'])
                 for i in range(1, MAX_LAYERS + 1):
                     target_p = adjust_price(self.current_price * (Decimal("1") - current_gap * i))
-                    # ★ 근접가드: 기존 + "이번 루프에서 방금 배치한" 주문까지 모두 비교
                     if any(abs(p - target_p) <= PROXIMITY_KRW for p in occupied_prices): continue
                     if current_bid_count < MAX_LAYERS:
-                        # 개수 상한 가드: 70개 도달 시 신규 매수 중단
                         if open_order_count >= MAX_OPEN_ORDERS:
                             logj("order_count_capped", count=open_order_count, cap=MAX_OPEN_ORDERS)
                             break
@@ -280,7 +282,7 @@ class EnterpriseShieldBotV3_3_1:
                             logj("place_buy", price=str(target_p))
                             current_bid_count += 1
                             open_order_count += 1
-                            occupied_prices.append(target_p)   # ★ FIX: 같은 루프 내 중복/근접 방지
+                            occupied_prices.append(target_p)
                             self.save_state()
                         time.sleep(0.3)
         except Exception:
@@ -288,7 +290,6 @@ class EnterpriseShieldBotV3_3_1:
 
     def check_fill(self):
         try:
-            # 일일 카운터 리셋 로직
             today = datetime.now().strftime("%Y-%m-%d")
             if today != self.last_sale_date:
                 self.daily_sale_count = 0
@@ -314,7 +315,6 @@ class EnterpriseShieldBotV3_3_1:
                                 changed = True
                         elif info['side'] == 'ask':
                             del self.grid_map[uid]
-                            # 매도 성공 시 카운트 증가
                             self.daily_sale_count += 1
                             net = (Decimal(str(o['price'])) * vol * Decimal("0.9995")) - (info['buy_price'] * vol * Decimal("1.0005"))
                             self.cumulative_net_profit += net
@@ -358,7 +358,7 @@ class EnterpriseShieldBotV3_3_1:
         return "NORMAL"
 
     def run(self):
-        logj("bot_start", v="3.3.1.Gap0.4-ProxFix")
+        logj("bot_start", v="3.3.2.StartupPurge")
         wm = WebSocketManager("ticker", [SYMBOL])
         last_loop_time = 0
         while True:
@@ -387,4 +387,4 @@ class EnterpriseShieldBotV3_3_1:
                 time.sleep(2)
 
 if __name__ == "__main__":
-    EnterpriseShieldBotV3_3_1().run()
+    EnterpriseShieldBotV3_3_2().run()
