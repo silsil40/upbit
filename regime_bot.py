@@ -266,7 +266,8 @@ def cycle(ex, st):
 def sleep_to_next_bar():
     now = time.time(); period = 15 * 60
     nxt = (math.floor(now / period) + 1) * period + LOOP_BUFFER_S
-    time.sleep(max(1, nxt - now))
+    while _RUNNING and time.time() < nxt:      # 정지신호 5초내 반응
+        time.sleep(min(5, max(0.1, nxt - time.time())))
 
 def reconcile_startup(ex, st):
     log.info("===== 시작 정합성 점검 =====")
