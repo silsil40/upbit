@@ -61,8 +61,9 @@ def make_exchange():
     key = os.environ.get("BINANCE_KEY"); sec = os.environ.get("BINANCE_SECRET")
     if not key or not sec:
         raise SystemExit("환경변수 BINANCE_KEY / BINANCE_SECRET 가 필요합니다.")
-    ex = ccxt.binanceusdm({"apiKey": key, "secret": sec, "enableRateLimit": True,
-                           "options": {"defaultType": "future"}})
+    # binanceusdm 의 선물 sandbox 는 deprecated → 통합 binance 클래스 + defaultType=future 사용
+    ex = ccxt.binance({"apiKey": key, "secret": sec, "enableRateLimit": True,
+                       "options": {"defaultType": "future", "adjustForTimeDifference": True}})
     if TESTNET:
         ex.set_sandbox_mode(True); log.info(">>> TESTNET (모의 USDT)")
     else:
