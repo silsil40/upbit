@@ -88,12 +88,13 @@ def make_exchange():
 def fetch_klines(ex, symbol, need=WARMUP_BARS, limit=1500):
     out, since = [], ex.milliseconds() - need * 15 * 60000
     tf_ms = ex.parse_timeframe(TF) * 1000
-    while True:
+    now = ex.milliseconds(); last = None
+    while since < now:
         b = ex.fetch_ohlcv(symbol, TF, since=since, limit=limit)
         if not b: break
         out += b
-        if len(b) < limit: break
-        since = b[-1][0] + tf_ms; time.sleep(ex.rateLimit / 1000)
+        if last is not None and b[-1][0] <= last: break    # 진전 없으면 중단
+        last = b[-1][0]; since = last + tf_ms; time.sleep(ex.rateLimit / 1000)
     if not out: return None
     df = pd.DataFrame(out, columns=["ts","open","high","low","close","volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
