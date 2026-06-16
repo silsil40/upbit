@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 
 # ===================== 설정 =====================
-DRY_RUN        = True                       # ★ 실거래는 False 로. 키 필요.
+DRY_RUN        = os.environ.get("DRY_RUN", "true").strip().lower() not in ("false", "0", "no")  # 기본 True(안전). 실거래: binance_env.sh 에 export DRY_RUN=false
 SYMBOLS        = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
 TF             = "15m"; BARS_DAY = 96; ANN = BARS_DAY * 365
 SD, LD, BAND   = 10, 40, 0.015
