@@ -130,9 +130,15 @@ def load_state():
         st["coins"][s].setdefault("stopped", False)
         st["coins"][s].setdefault("tsign", 0.0)
         st["coins"][s].setdefault("held_sign", 0.0)
-    if DRY_RUN and "sim" not in st:
-        st["sim"] = {"cash": START_EQUITY, "positions": {s: 0.0 for s in SYMBOLS},
-                     "entry": {s: 0.0 for s in SYMBOLS}, "price": {s: 0.0 for s in SYMBOLS}}
+    st.setdefault("equity_peak", 0.0)
+    st.setdefault("halted", False)
+    if DRY_RUN:                                # sim 하위키까지 모두 보정(옛/불완전 상태 호환)
+        st.setdefault("sim", {})
+        st["sim"].setdefault("cash", START_EQUITY)
+        for k in ("positions", "entry", "price"):
+            st["sim"].setdefault(k, {})
+            for s in SYMBOLS:
+                st["sim"][k].setdefault(s, 0.0)
     return st
 
 def save_state(st):
