@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-장세전환 추세추종 봇 — 실거래 버전 (보강 1·3·4 반영)
+장세전환 추세추종 봇 — 실거래 버전 (보강 1·3·4 + 패치 5·6 반영)
 
 전략(불변): BTC/ETH 균등, USDT 무기한선물, 15분봉, 무레버리지(1x)
  - 레짐: 단기SMA(10일=960봉) vs 장기SMA(40일=3840봉) ±1.5% → 롱/숏/현금
@@ -12,16 +12,33 @@
 ★ 보강 (실거래 안전) ★
  (1) 킬스위치 평가액 = 미실현손익 포함(marginBalance). 시작 시 wallet/margin 로그로 검증.
  (3) 손절 = "진입가 대비 현재가"로 매 사이클 재계산(누적 아님 → 다운타임 드리프트 없음).
-     실거래: 거래소 entryPrice(가중평균) / 드라이런: 저장 진입가.
  (4) 코인별 즉시 상태저장(중간 크래시 일관성).
+
+★ 패치 (5) — 코드리뷰 반영 ★
+ (5a) 킬스위치 경로 강화: halted 선(先)기록 → 청산 시도, 심볼별 예외 격리,
+      가격은 fetch_ticker 사용. halted 상태에서도 잔여 포지션은 매 사이클 청산 재시도.
+ (5b) reduceOnly 조건 수정: 전량청산(target=0)에도 reduceOnly 적용. 반전 주문은 제외.
+ (5d) 데이터 신선도 가드: 마지막 완성봉이 45분 이상 낡으면 해당 코인 매매 스킵.
+ (5e) 코인별 try/except 격리. (5f) create_order 실패 시 크래시 대신 FAIL 기록.
+
+★ 패치 (6) — 로그 개선 ★
+ (6a) 체결 로그에 매수/매도/청산 구분 + 청산·축소 시 실현손익(USDT, %) 표기.
+ (6b) 코인별 [포지션] 한 줄 요약: 방향/수량/진입가/현재가/평가손익.
+ (6c) [CYCLE] 라인에 누적손익(시작 대비 ± USDT, %) 추가.
+      ※ equity_start 는 이 버전 첫 실행 시점 평가액으로 기록됨.
+        실제 투입원금 기준으로 보려면 state 파일의 equity_start 를 수동 수정.
+ (6d) 로그 용량 상한: regime_bot.log 5MB×3개 회전, audit 20MB 초과 시 .old 로 교체.
+      → 디스크/메모리 무한 증식 방지.
 
 ★ 모드 ★
  - DRY_RUN=True  : 모의(공개시세+가상체결, 키 불필요). ← 기본값(안전)
  - DRY_RUN=False : 실거래(진짜 돈). 실계정 선물키 필요. systemd 권장.
  ※ 실거래 전환 시 반드시 state 파일을 새로 시작할 것(드라이런 고점 잔재 → 즉시 킬스위치 방지).
+ ※ 입출금 시: 봇 정지 → state의 equity_peak/equity_start 수동 조정 → 재시작.
 """
 
 import os, time, json, math, logging, signal as _sig
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
@@ -38,13 +55,18 @@ KILL_DD        = 0.40; LEVERAGE = 1
 START_EQUITY   = 10000.0                    # 드라이런 가상 시작 잔고
 WARMUP_BARS    = LD * BARS_DAY + 600
 LOOP_BUFFER_S  = 20
+STALE_MIN      = 45                          # (5d) 마지막 봉이 이보다 낡으면 스킵
+LOG_MAX_BYTES  = 5_000_000                   # (6d) 로그 파일 1개 최대 5MB
+LOG_BACKUPS    = 3                           # (6d) 회전 보관 개수
+AUDIT_MAX_BYTES= 20_000_000                  # (6d) audit 20MB 초과 시 .old 교체
 STATE_PATH     = "regime_bot_state.json"
 LOG_PATH       = "regime_bot.log"
 AUDIT_PATH     = "regime_bot_audit.jsonl"
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s",
-                    handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8"),
+                    handlers=[RotatingFileHandler(LOG_PATH, maxBytes=LOG_MAX_BYTES,
+                                                  backupCount=LOG_BACKUPS, encoding="utf-8"),
                               logging.StreamHandler()])
 log = logging.getLogger("regime_bot")
 
@@ -55,6 +77,11 @@ _sig.signal(_sig.SIGINT, _stop); _sig.signal(_sig.SIGTERM, _stop)
 
 
 def audit(rec):
+    try:                                     # (6d) audit 무한 증식 방지
+        if os.path.exists(AUDIT_PATH) and os.path.getsize(AUDIT_PATH) > AUDIT_MAX_BYTES:
+            os.replace(AUDIT_PATH, AUDIT_PATH + ".old")
+    except Exception:
+        pass
     rec["ts"] = datetime.now(timezone.utc).isoformat()
     with open(AUDIT_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -98,6 +125,17 @@ def fetch_klines(ex, symbol, need=WARMUP_BARS, limit=1500):
     df = df.set_index("ts").sort_index()
     df = df[~df.index.duplicated(keep="first")]
     return df.iloc[:-1].tail(need)
+
+
+def get_price(ex, st, symbol):
+    """(5a) 청산 등 '가격 하나'만 필요할 때: 4천봉 페이지네이션 대신 티커 1회.
+    드라이런: 직전 사이클 저장가 우선, 없으면 티커(공개 API)."""
+    if DRY_RUN:
+        p = st.get("sim", {}).get("price", {}).get(symbol)
+        if p:
+            return float(p)
+    t = ex.fetch_ticker(symbol)
+    return float(t.get("last") or t.get("close"))
 
 
 # ===================== 신호 =====================
@@ -186,7 +224,7 @@ def market_limits(ex, symbol):
             (m["limits"].get("cost") or {}).get("min") or 0.0)
 
 
-def place_to(ex, st, symbol, target_qty, cur_qty, price):
+def place_to(ex, st, symbol, target_qty, cur_qty, price, entry=0.0):
     delta = target_qty - cur_qty
     if abs(delta) < 1e-12:
         return "HOLD", "변화없음"
@@ -199,22 +237,49 @@ def place_to(ex, st, symbol, target_qty, cur_qty, price):
     if not reducing and (amt < min_amt or (min_cost and notional < min_cost)):
         return "SKIP_MIN", f"최소미달 amt={amt}<{min_amt} or notional={notional:.2f}<{min_cost}"
     side = "buy" if delta > 0 else "sell"
+
+    # (6a) 실현손익 계산: 청산/축소/반전 시 닫히는 수량 × (현재가-진입가) 기준(근사: 신호가 사용)
+    realized, realized_pct = None, None
+    if cur_qty != 0 and entry > 0:
+        if target_qty == 0 or np.sign(target_qty) != np.sign(cur_qty):
+            closed = abs(cur_qty)
+        elif reducing:
+            closed = abs(cur_qty) - abs(target_qty)
+        else:
+            closed = 0.0
+        if closed > 0:
+            realized = (price - entry) * closed * np.sign(cur_qty)
+            realized_pct = np.sign(cur_qty) * (price / entry - 1.0) * 100
+    tag = ("청산" if target_qty == 0 else
+           "반전" if (cur_qty != 0 and np.sign(target_qty) != np.sign(cur_qty)) else
+           "축소" if reducing else
+           ("매수" if side == "buy" else "매도"))
+    pnl_txt = f" | 실현손익 {realized:+.2f} USDT ({realized_pct:+.2f}%)" if realized is not None else ""
+
     if DRY_RUN:
         # 가상 체결 + (3) 드라이런 진입가(가중평균) 갱신
         old_q, old_e = cur_qty, st["sim"]["entry"].get(symbol, 0.0)
-        if target_qty == 0:                                  entry = 0.0
-        elif old_q == 0 or np.sign(target_qty) != np.sign(old_q): entry = price
+        if target_qty == 0:                                  new_e = 0.0
+        elif old_q == 0 or np.sign(target_qty) != np.sign(old_q): new_e = price
         elif abs(target_qty) > abs(old_q):                   # 같은 방향 추가
-            entry = (abs(old_q)*old_e + (abs(target_qty)-abs(old_q))*price) / abs(target_qty)
-        else:                                                entry = old_e   # 축소
-        st["sim"]["entry"][symbol] = entry
+            new_e = (abs(old_q)*old_e + (abs(target_qty)-abs(old_q))*price) / abs(target_qty)
+        else:                                                new_e = old_e   # 축소
+        st["sim"]["entry"][symbol] = new_e
         st["sim"]["cash"] -= delta * price + abs(delta) * price * (FEE + SLIP)
         st["sim"]["positions"][symbol] = target_qty
-        log.info(f"  [DRY] {symbol} {side} {amt} (≈{notional:.2f} USDT) 가상체결")
+        log.info(f"  [체결·DRY] {symbol} {tag} {side} {amt} (≈{notional:.2f} USDT){pnl_txt}")
         return "TRADE", f"DRY {side} {amt}"
-    params = {"reduceOnly": True} if reducing and np.sign(target_qty) == np.sign(cur_qty) else {}
-    o = ex.create_order(symbol, "market", side, amt, params=params)
-    log.info(f"  주문 {symbol} {side} {amt} (≈{notional:.2f} USDT) id={o.get('id')}")
+    # (5b) reduceOnly: 전량청산(target=0) 포함, 같은 방향 축소 포함. 반전(부호 뒤집힘)만 제외.
+    #      → 봇 인식과 실제 포지션이 어긋나도 청산 주문이 반대 포지션을 열 수 없음.
+    params = {"reduceOnly": True} if reducing and (target_qty == 0 or np.sign(target_qty) == np.sign(cur_qty)) else {}
+    try:                                                     # (5f) 주문 실패 = 크래시 아님
+        o = ex.create_order(symbol, "market", side, amt, params=params)
+    except Exception as e:
+        log.error(f"  주문 실패 {symbol} {side} {amt}: {e}")
+        audit({"event": "order_fail", "symbol": symbol, "side": side,
+               "amt": amt, "reduceOnly": bool(params), "error": str(e)})
+        return "FAIL", f"주문 실패: {e}"
+    log.info(f"  [체결] {symbol} {tag} {side} {amt} (≈{notional:.2f} USDT) id={o.get('id')}{pnl_txt}")
     return "TRADE", f"{side} {amt}"
 
 
@@ -225,6 +290,18 @@ def verify_position(ex, st, symbol, target_qty):
     min_amt, _ = market_limits(ex, symbol)
     tol = max(min_amt, abs(target_qty) * 0.03, 1e-8)
     return ("MATCH" if abs(cur - target_qty) <= tol else "MISMATCH"), cur
+
+
+def log_position(symbol, qty, entry, price):
+    """(6b) 코인별 한 줄 포지션 요약."""
+    if qty == 0:
+        log.info(f"[포지션] {symbol} 현금 (보유 없음)")
+        return
+    upnl = qty * (price - entry) if entry > 0 else 0.0
+    upct = np.sign(qty) * (price / entry - 1.0) * 100 if entry > 0 else 0.0
+    side_k = "롱" if qty > 0 else "숏"
+    log.info(f"[포지션] {symbol} {side_k} {abs(qty)} | 진입 {entry:.2f} → 현재 {price:.2f} "
+             f"| 평가손익 {upnl:+.2f} USDT ({upct:+.2f}%)")
 
 
 # ===================== 자가 점검 =====================
@@ -265,78 +342,124 @@ def startup_selftest(ex, st):
     return ok
 
 
+# ===================== 킬스위치/청산 =====================
+def flatten_all(ex, st, why):
+    """(5a) 전 코인 청산. 심볼별 예외 격리 + 티커 가격. 실패해도 다른 코인은 계속."""
+    all_flat = True
+    for s in SYMBOLS:
+        try:
+            cur, entry = get_position(ex, st, s)
+            if cur == 0:
+                continue
+            px = get_price(ex, st, s)
+            action, reason = place_to(ex, st, s, 0.0, cur, px, entry)
+            if action not in ("TRADE", "HOLD"):
+                all_flat = False
+                log.error(f"[{why}] {s} 청산 미완: {action} {reason}")
+            else:
+                log.info(f"[{why}] {s} 청산 주문 완료")
+        except Exception as e:
+            all_flat = False
+            log.error(f"[{why}] {s} 청산 실패(다음 사이클 재시도): {e}")
+            audit({"event": "flatten_fail", "why": why, "symbol": s, "error": str(e)})
+    return all_flat
+
+
 # ===================== 1회 사이클 =====================
 def cycle(ex, st):
     equity = get_equity(ex, st)
     if equity <= 0:
         log.warning("평가액 0 - 스킵"); return
+    st.setdefault("equity_start", equity)        # (6c) 최초 실행 시점 기준값
     st["equity_peak"] = max(st.get("equity_peak", 0.0), equity)
     dd = equity / st["equity_peak"] - 1 if st["equity_peak"] > 0 else 0.0
-    log.info(f"[CYCLE]{' DRY' if DRY_RUN else ''} equity={equity:.2f} peak={st['equity_peak']:.2f} "
-             f"낙폭={dd*100:+.1f}% (킬스위치 -{KILL_DD*100:.0f}%까지 {(-(KILL_DD)-dd)*100:+.1f}%p)")
+    tot = equity - st["equity_start"]
+    tot_pct = tot / st["equity_start"] * 100 if st["equity_start"] > 0 else 0.0
+    log.info(f"[CYCLE]{' DRY' if DRY_RUN else ''} equity={equity:.2f} "
+             f"| 누적 {tot:+.2f} USDT ({tot_pct:+.1f}%) "
+             f"| peak={st['equity_peak']:.2f} 낙폭={dd*100:+.1f}% "
+             f"(킬스위치 -{KILL_DD*100:.0f}%까지 {(-(KILL_DD)-dd)*100:+.1f}%p)")
 
     if st["equity_peak"] > 0 and equity <= st["equity_peak"] * (1 - KILL_DD):
         log.error(f"!! 킬스위치 발동 (낙폭 {dd*100:.1f}%) - 전량청산 후 정지")
-        for s in SYMBOLS:
-            cur, _ = get_position(ex, st, s)
-            if cur != 0:
-                px = st["sim"]["price"].get(s) if DRY_RUN else signal_for(fetch_klines(ex, s))[2]
-                place_to(ex, st, s, 0.0, cur, px)
-        st["halted"] = True; save_state(st)
+        st["halted"] = True; save_state(st)      # (5a) 청산 시도 '전에' 먼저 기록(크래시 나도 halted 유지)
         audit({"event":"killswitch","equity":equity,"peak":st["equity_peak"],"dd":dd})
+        ok = flatten_all(ex, st, "killswitch")
+        if not ok:
+            log.error("킬스위치 청산 일부 실패 - halted 상태에서 매 사이클 재시도. 수동 확인 요망.")
+        save_state(st)
         return
     if st.get("halted"):
+        # (5a) halted여도 잔여 포지션은 계속 청산 시도(신규 진입만 금지) → 청산 실패 자가치유
+        flatten_all(ex, st, "halted")
         log.warning("halted - 매매 안 함 (점검 후 state에서 halted=false로)"); return
 
     alloc = equity / len(SYMBOLS)
     for s in SYMBOLS:
-        cs = st["coins"][s]
-        df = fetch_klines(ex, s)
-        if df is None or len(df) < LD * BARS_DAY:
-            log.warning(f"{s} 데이터 부족 - 스킵")
-            audit({"event":"cycle","symbol":s,"action":"SKIP_DATA"}); continue
-        sgn, size, price, diag = signal_for(df)
-        if DRY_RUN: st["sim"]["price"][s] = price
-        cur_qty, entry = get_position(ex, st, s)
-        cur_frac = (cur_qty * price) / alloc if alloc > 0 else 0.0
+        try:                                     # (5e) 코인별 격리: BTC 에러가 ETH를 막지 않음
+            cs = st["coins"][s]
+            df = fetch_klines(ex, s)
+            if df is None or len(df) < LD * BARS_DAY:
+                log.warning(f"{s} 데이터 부족 - 스킵")
+                audit({"event":"cycle","symbol":s,"action":"SKIP_DATA"}); continue
+            # (5d) 신선도 가드: 마지막 완성봉이 너무 낡으면 낡은 신호로 매매하지 않음
+            age_min = (pd.Timestamp.now(tz="UTC") - df.index[-1]).total_seconds() / 60
+            if age_min > STALE_MIN:
+                log.warning(f"{s} 데이터 낡음(마지막봉 {age_min:.0f}분 전) - 스킵")
+                audit({"event":"cycle","symbol":s,"action":"SKIP_STALE","age_min":round(age_min,1)})
+                continue
+            sgn, size, price, diag = signal_for(df)
+            if DRY_RUN: st["sim"]["price"][s] = price
+            cur_qty, entry = get_position(ex, st, s)
+            cur_frac = (cur_qty * price) / alloc if alloc > 0 else 0.0
 
-        # (3) 손절: 진입가 대비 현재가 (누적 아님)
-        if cur_qty != 0 and entry > 0:
-            pnl = np.sign(cur_qty) * (price / entry - 1.0)
-            if pnl <= -STOP:
-                cs["stopped"] = True
-        if sgn != cs["tsign"]:
-            cs["stopped"] = False; cs["tsign"] = sgn
-        desired = 0.0 if cs["stopped"] else sgn * size
-        regime = {1.0:"롱",-1.0:"숏",0.0:"현금"}[sgn]
+            # (3) 손절: 진입가 대비 현재가 (누적 아님)
+            if cur_qty != 0 and entry > 0:
+                pnl = np.sign(cur_qty) * (price / entry - 1.0)
+                if pnl <= -STOP:
+                    cs["stopped"] = True
+            if sgn != cs["tsign"]:
+                cs["stopped"] = False; cs["tsign"] = sgn
+            desired = 0.0 if cs["stopped"] else sgn * size
+            regime = {1.0:"롱",-1.0:"숏",0.0:"현금"}[sgn]
 
-        action, reason, verify, cur_after = "HOLD", "밴드내", "NA", cur_qty
-        target_qty = cur_qty
-        if (np.sign(desired) != np.sign(cur_frac)) or (abs(desired - cur_frac) > REBAL_BAND):
-            raw_qty = desired * alloc / price
-            min_amt, _ = market_limits(ex, s)
-            if abs(raw_qty) < (min_amt or 0.0):     # 목표 0/최소단위 미만 → 전량청산(0). amount_to_precision(0) 회피
-                target_qty = 0.0
-            else:                                    # abs 로 정밀도 적용 후 부호 복원(음수 직접 전달 회피)
-                target_qty = math.copysign(float(ex.amount_to_precision(s, abs(raw_qty))), raw_qty)
-            action, reason = place_to(ex, st, s, target_qty, cur_qty, price)
-            if action == "TRADE":
-                verify, cur_after = verify_position(ex, st, s, target_qty)
-                cs["held_sign"] = float(np.sign(desired))
-                lvl = log.info if verify == "MATCH" else log.error
-                lvl(f"{s} 레짐={regime} 비중 {cur_frac:+.2f}→{desired:+.2f} | 체결검증={verify} "
-                    f"(목표qty={target_qty} 실제={cur_after})")
+            action, reason, verify, cur_after = "HOLD", "밴드내", "NA", cur_qty
+            target_qty = cur_qty
+            if (np.sign(desired) != np.sign(cur_frac)) or (abs(desired - cur_frac) > REBAL_BAND):
+                raw_qty = desired * alloc / price
+                min_amt, _ = market_limits(ex, s)
+                if abs(raw_qty) < (min_amt or 0.0):     # 목표 0/최소단위 미만 → 전량청산(0). amount_to_precision(0) 회피
+                    target_qty = 0.0
+                else:                                    # abs 로 정밀도 적용 후 부호 복원(음수 직접 전달 회피)
+                    target_qty = math.copysign(float(ex.amount_to_precision(s, abs(raw_qty))), raw_qty)
+                action, reason = place_to(ex, st, s, target_qty, cur_qty, price, entry)
+                if action == "TRADE":
+                    verify, cur_after = verify_position(ex, st, s, target_qty)
+                    cs["held_sign"] = float(np.sign(desired))
+                    lvl = log.info if verify == "MATCH" else log.error
+                    lvl(f"{s} 레짐={regime} 비중 {cur_frac:+.2f}→{desired:+.2f} | 체결검증={verify} "
+                        f"(목표qty={target_qty} 실제={cur_after})")
+                else:
+                    log.info(f"{s} 레짐={regime} 목표 {desired:+.2f} 이지만 {action}: {reason}")
             else:
-                log.info(f"{s} 레짐={regime} 목표 {desired:+.2f} 이지만 {action}: {reason}")
-        else:
-            cs["held_sign"] = float(np.sign(cur_frac))
-            log.info(f"{s} 레짐={regime} 비중 {cur_frac:+.2f}≈목표{desired:+.2f} - 유지")
+                cs["held_sign"] = float(np.sign(cur_frac))
+                log.info(f"{s} 레짐={regime} 비중 {cur_frac:+.2f}≈목표{desired:+.2f} - 유지")
 
-        audit({"event":"cycle","symbol":s,"regime":regime,"stopped":cs["stopped"],
-               "entry":round(entry,2),"cur_frac":round(cur_frac,4),
-               "desired_frac":round(desired,4),"action":action,"reason":reason,
-               "target_qty":target_qty,"verify":verify,"qty_after":cur_after,**diag})
-        save_state(st)        # (4) 코인별 즉시 저장
+            # (6b) 포지션 요약 한 줄: 매매 직후엔 최신 상태 재조회, 아니면 기존 값 재사용
+            if action == "TRADE":
+                qty_now, entry_now = get_position(ex, st, s)
+            else:
+                qty_now, entry_now = cur_qty, entry
+            log_position(s, qty_now, entry_now, price)
+
+            audit({"event":"cycle","symbol":s,"regime":regime,"stopped":cs["stopped"],
+                   "entry":round(entry,2),"cur_frac":round(cur_frac,4),
+                   "desired_frac":round(desired,4),"action":action,"reason":reason,
+                   "target_qty":target_qty,"verify":verify,"qty_after":cur_after,**diag})
+            save_state(st)        # (4) 코인별 즉시 저장
+        except Exception as e:                   # (5e)
+            log.exception(f"{s} 처리 에러(다음 코인 계속): {e}")
+            audit({"event":"error","symbol":s,"error":str(e)})
     save_state(st)
 
 
