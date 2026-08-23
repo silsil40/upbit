@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-[KRW-SOL Grid v4.1 - CostCap]
+[KRW-SOL Grid v4.2 - RaceFix]
+
+v4.1 대비 변경점:
+ ★ (I) 매도 체결/정합 경합 수정: reconcile 이 매도 항목을 삭제하기 전에 주문 상세를
+       조회해, 체결(done)된 매도면 손익 정산(trade_success_reconciled) 후 삭제.
+       + check_fill 을 reconcile 앞으로 이동(체결 정산 우선) → 체결이 정산 없이
+       증발하고 그 자리에 매수가 깔리던 경합 창 제거.
+ ★ (J) 재고 상한 재확인: 매수 배치 루프 '매 회차'마다 상한 체크. 한 사이클에
+       여러 레이어를 깔 때 상한을 초과하던 구멍 봉쇄.
 
 v4.0 대비 변경점:
  ★ (G) 재고 상한을 '시가 평가액' → '투입 원가' 기준으로 변경.
@@ -393,7 +401,24 @@ class GridBotV4:
                 for uid, info in self.grid_map.items():
                     if uid not in actual_uuids and (now - info.get('timestamp', 0) > 20):
                         if info['side'] == 'bid': continue
-                        if info['side'] == 'ask': to_delete.append(uid)
+                        if info['side'] == 'ask':
+                            # ★ (I) 삭제 전 체결 여부 확인: 체결된 매도면 정산 후 삭제
+                            #   (check_fill 이 채가기 전에 reconcile 이 먼저 도는 경합 창 방어)
+                            try:
+                                detail = self.upbit.get_order(uid) or {}
+                                exec_vol = Decimal(str(detail.get('executed_volume', '0')))
+                                d_state = detail.get('state', '')
+                            except Exception:
+                                exec_vol, d_state = Decimal('0'), ''
+                            if d_state == 'done' and exec_vol > 0:
+                                net = (Decimal(str(detail.get('price', info['sell_price']))) * exec_vol * Decimal("0.9995")) \
+                                      - (info['buy_price'] * exec_vol * Decimal("1.0005"))
+                                self.cumulative_net_profit += net
+                                self.daily_sale_count += 1
+                                logj("trade_success_reconciled", profit=str(round(net, 2)),
+                                     total=str(round(self.cumulative_net_profit, 2)),
+                                     daily_sales=self.daily_sale_count)
+                            to_delete.append(uid)
                 for uid in to_delete: del self.grid_map[uid]
 
                 for o in actual_orders:
@@ -528,6 +553,12 @@ class GridBotV4:
                     target_p = adjust_price(self.current_price * (Decimal("1") - current_gap * i))
                     if any(abs(p - target_p) <= PROXIMITY_KRW for p in occupied_prices): continue
                     if current_bid_count < MAX_LAYERS:
+                        # ★ (J) 매 배치 직전 상한 재확인: 한 사이클에 여러 개 깔 때도 초과 불가
+                        if self.inventory_cost_krw() + BUY_AMOUNT_KRW > MAX_INVENTORY_KRW:
+                            logj("buy_blocked_inventory_next",
+                                 inventory_cost_krw=str(round(self.inventory_cost_krw(), 0)),
+                                 cap=str(MAX_INVENTORY_KRW))
+                            break
                         balance = Decimal(str(self.upbit.get_balance("KRW")))
                         if balance < (BUY_AMOUNT_KRW * Decimal("1.0005")): break
                         vol = BUY_AMOUNT_KRW / target_p
@@ -619,7 +650,7 @@ class GridBotV4:
 
     # ---------- 메인 루프 ----------
     def run(self):
-        logj("bot_start", v="4.1.CostCap", dry=DRY_RUN,
+        logj("bot_start", v="4.2.RaceFix", dry=DRY_RUN,
              inventory_cap=str(MAX_INVENTORY_KRW), gate_ma_days=GATE_MA_DAYS)
         wm = WebSocketManager("ticker", [SYMBOL])
         err_streak = 0
@@ -639,6 +670,7 @@ class GridBotV4:
                 if time.time() - last_loop_time > 4:
                     self.update_24h_high()
                     self.update_gate()                         # ★ (D)
+                    self.check_fill()                          # ★ (I) reconcile 보다 먼저: 체결 정산 우선
                     self.reconcile_orders()
                     self.current_mode = self.decide_mode()
                     if self.current_mode != self.last_mode:
@@ -646,7 +678,6 @@ class GridBotV4:
                         self.reset_buy_grid()
                         self.last_mode = self.current_mode
                     self.maintain_grid()
-                    self.check_fill()
                     mdd_val = (self.current_price - self.rolling_24h_high) / self.rolling_24h_high if self.rolling_24h_high > 0 else 0
                     logj("status", mode=self.current_mode,
                          gate="OPEN" if self.gate_open else "CLOSED",
