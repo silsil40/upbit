@@ -30,7 +30,7 @@ import pandas as pd
 
 # ===================== 설정 =====================
 DRY_RUN     = True                     # 이 봇은 주문 코드 자체가 없음. 표시용.
-SYMBOLS     = {"SOL": "SOL/USDT:USDT", "XRP": "XRP/USDT:USDT"}
+SYMBOLS     = {"SOL": "SOLUSDT", "XRP": "XRPUSDT"}   # 바이낸스 USD-M 선물 심볼
 PRINCIPAL   = 1_000_000 / 1400         # 가상 원금(USDT). 100만원 ≈ 714 USDT 기준. 코인별 반반
 LEV         = 1.0                      # 기록은 1배. 2·3배 성적은 리포트에서 근사 환산
 BASE_SIG    = 0.0025                   # BTC 2022~24 중앙 15분 변동폭 (백테스트와 동일 고정값)
@@ -207,33 +207,63 @@ class Engine:
         return self.equity + (self.qty * (c - self.avg) if self.inpos else 0.0)
 
 
-# ---------------- 데이터 ----------------
-class Feed:
-    def __init__(self):
-        import ccxt
-        self.ex = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "future"}})
+# ---------------- 데이터 (ccxt 없이 바이낸스 공개 API 직접 — 메모리 절약) ----------------
+FAPI = "https://fapi.binance.com"
 
-    def ohlcv(self, symbol, since_ms=None, n=HIST_BARS):
-        out, since = [], since_ms or (self.ex.milliseconds() - n * BAR_MS)
-        while True:
-            b = self.ex.fetch_ohlcv(symbol, "5m", since=since, limit=1500)
+
+def http_get(path, params):
+    import urllib.request, urllib.parse
+    url = f"{FAPI}{path}?{urllib.parse.urlencode(params)}"
+    for k in range(3):
+        try:
+            with urllib.request.urlopen(url, timeout=15) as r:
+                return json.loads(r.read().decode())
+        except Exception as e:
+            if k == 2:
+                raise
+            time.sleep(2 * (k + 1))
+
+
+class Feed:
+    COLS = ["ts", "open", "high", "low", "close", "volume"]
+
+    def __init__(self):
+        self.cache = {}                                   # 심볼별 최근 HIST_BARS 봉
+
+    def _fetch(self, symbol, since_ms):
+        out, since = [], since_ms
+        now = int(time.time() * 1000)
+        while since < now:                                # 한 번에 최대 1000개 → 끝까지 반복
+            b = http_get("/fapi/v1/klines", {"symbol": symbol, "interval": "5m", "startTime": since, "limit": 1000})
             if not b:
                 break
-            out += b
-            if len(b) < 1500:
+            out += [[int(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])] for x in b]
+            nxt = int(b[-1][0]) + BAR_MS
+            if nxt <= since:
                 break
-            since = b[-1][0] + BAR_MS
-            time.sleep(self.ex.rateLimit / 1000)
-        df = pd.DataFrame(out, columns=["ts", "open", "high", "low", "close", "volume"]).drop_duplicates("ts")
-        now = self.ex.milliseconds()
-        return df[df["ts"] + BAR_MS <= now].sort_values("ts").reset_index(drop=True)   # 마감된 봉만
+            since = nxt
+            time.sleep(0.2)
+        return pd.DataFrame(out, columns=self.COLS)
+
+    def ohlcv(self, symbol, n=HIST_BARS):
+        now = int(time.time() * 1000)
+        old = self.cache.get(symbol)
+        if old is None or len(old) == 0:
+            df = self._fetch(symbol, now - n * BAR_MS)
+        else:                                             # 새 봉만 받아 이어붙임
+            new = self._fetch(symbol, int(old["ts"].iloc[-1]) + BAR_MS)
+            df = pd.concat([old, new], ignore_index=True) if len(new) else old
+        df = df.drop_duplicates("ts").sort_values("ts")
+        df = df[df["ts"] + BAR_MS <= now].tail(n).reset_index(drop=True)   # 마감된 봉만, 최근 n개
+        self.cache[symbol] = df
+        return df
 
     def funding(self, symbol, ts_ms):
         """정산 시각(ts_ms)의 실제 펀딩비. 실패 시 0.01% (롱에 불리하게) 가정"""
         try:
-            fr = self.ex.fetch_funding_rate_history(symbol, since=ts_ms - 60_000, limit=5)
+            fr = http_get("/fapi/v1/fundingRate", {"symbol": symbol, "startTime": ts_ms - 60_000, "limit": 5})
             for f in fr:
-                if abs(f["timestamp"] - ts_ms) <= 60_000:
+                if abs(int(f["fundingTime"]) - ts_ms) <= 60_000:
                     return float(f["fundingRate"])
         except Exception as e:
             log.info(f"[경고] 펀딩 조회 실패 {symbol}: {e}")
