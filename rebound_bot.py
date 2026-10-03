@@ -9,7 +9,7 @@
 확정 스펙
   코인    : SOL·XRP 바이낸스 USD-M 무기한선물, 롱만, 원금 반반, 코인별 장부 · 수익 복리 재투입
   배율    : 최근 7일 15분 변동폭 ÷ 0.250%(BTC 2022~24 중앙값), 0.5~4 로 제한
-  진입    : 15분 거래량 ≥ 평소(24h) 1.5배 & 15분 수익률 ≤ -0.4%×배율 & 변동성 국면(24h/7일) ≥ 1.5
+  진입    : 15분 거래량 ≥ 평소(24h) 1.5배 & 15분 수익률 ≤ -0.4%×배율 & 변동성 국면(24h/30일) ≥ 1.5  [D 버전]
             → 신호 봉 종가에 지정가 매수, 15분(3봉) 안에 닿으면 체결, 아니면 취소 / 첫 진입 = 한도 × 1/4
   추가    : 마지막 추가가 대비 -0.8%×배율마다 보유의 25% (한도 = 평가액 × LEV)
   익절    : 평단 +0.3%×배율 이상에서 급등 쏠림 → 최대물량 25% 지정가(15분) / 평단 +3%×배율 전량 지정가
@@ -38,7 +38,9 @@ P = dict(vr=1.5, mv=0.004, regime=1.5, probe=0.25, add_gap=0.008, add_frac=0.25,
          tp_min=0.003, tp_max=0.03, cut_min=0.01, stop=0.06, stop_cap=0.10, exit_frac=0.25,
          time_stop_h=36, limit_bars=3)
 MAKER, TAKER, SLIP = 0.0002, 0.0005, 0.0003
-HIST_BARS   = 2600                     # 지표 계산용 5분봉 (7일 = 2016봉 + 여유)
+REGIME_WIN  = 30 * 288                 # 국면 분모: 30일 (D 버전, 2026-10-03 변경 — 이전 A 버전은 7일=2016봉)
+MIN_BARS    = REGIME_WIN + 288 + 50     # 지표가 유효해지는 최소 봉 수
+HIST_BARS   = MIN_BARS + 300            # 지표 계산용 5분봉
 BAR_MS      = 300_000
 DIR         = os.path.dirname(os.path.abspath(__file__))
 STATE_F     = os.path.join(DIR, "rebound_bot_state.json")
@@ -67,7 +69,7 @@ def features(df):
     v15 = v.rolling(3).sum()
     vr = v15 / v15.rolling(288).mean().shift(3)
     rv = c.pct_change()
-    regime = rv.rolling(288).std() / rv.rolling(2016).std()
+    regime = rv.rolling(288).std() / rv.rolling(REGIME_WIN).std()        # 24시간 ÷ 30일
     sig15 = r15.rolling(2016).std().shift(1)
     return r15, vr, regime.fillna(0.0), sig15
 
@@ -297,7 +299,7 @@ def append_csv(path, rows):
 def run():
     setup_log()
     log.info("=" * 70)
-    log.info(f"리바운드 전략 드라이런 시작 — 코인 {list(SYMBOLS)} · 원금 {PRINCIPAL:.1f} USDT(반반) · 기록 레버리지 {LEV:g}배")
+    log.info(f"리바운드 전략 드라이런 시작 [D 버전: 국면 = 24h ÷ {REGIME_WIN//288}일] — 코인 {list(SYMBOLS)} · 원금 {PRINCIPAL:.1f} USDT(반반) · 기록 레버리지 {LEV:g}배")
     feed = Feed()
     st = load_state()
     engines = {k: Engine(k, PRINCIPAL / len(SYMBOLS)) for k in SYMBOLS}
@@ -314,7 +316,7 @@ def run():
             eq_row = {"ts": None}
             for k, sym in SYMBOLS.items():
                 df = feed.ohlcv(sym)
-                if len(df) < 2100:
+                if len(df) < MIN_BARS:
                     log.info(f"[{k}] 이력 부족({len(df)}봉) — 대기"); continue
                 r15, vr, regime, sig = features(df)
                 # 처리할 새 봉: last_ts 이후 마감된 봉 전부 (재시작 시 놓친 봉 따라잡기)
@@ -322,7 +324,7 @@ def run():
                 if last_ts[k] is None:
                     start = len(df) - 1                      # 첫 실행은 최신 봉부터
                 mtm = None
-                for i in range(max(start, 2100), len(df)):
+                for i in range(max(start, MIN_BARS), len(df)):
                     row = df.iloc[i]
                     ts = int(row["ts"])
                     fr = 0.0
