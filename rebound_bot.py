@@ -9,7 +9,8 @@
 확정 스펙
   코인    : SOL·XRP 바이낸스 USD-M 무기한선물, 롱만, 원금 반반, 코인별 장부 · 수익 복리 재투입
   배율    : 최근 7일 15분 변동폭 ÷ 0.250%(BTC 2022~24 중앙값), 0.5~4 로 제한
-  진입    : 15분 거래량 ≥ 평소(24h) 1.5배 & 15분 수익률 ≤ -0.4%×배율 & 변동성 국면(24h/30일) ≥ 1.5  [D 버전]
+  진입    : 15분 거래량 ≥ 평소(24h) 1.5배 & 15분 수익률 ≤ -0.4%×배율, 그리고  [T2 버전, 2026-10-06]
+            국면(24h/30일) ≥ 1.5 → 정상 크기 / 국면 1.2~1.5 & 코인 상승추세(10일>40일×1.015) → 절반 크기(첫 진입·물타기 한도 모두 절반)
             → 신호 봉 종가에 지정가 매수, 15분(3봉) 안에 닿으면 체결, 아니면 취소 / 첫 진입 = 한도 × 1/4
   추가    : 마지막 추가가 대비 -0.8%×배율마다 보유의 25% (한도 = 평가액 × LEV)
   익절    : 평단 +0.3%×배율 이상에서 급등 쏠림 → 최대물량 25% 지정가(15분) / 평단 +3%×배율 전량 지정가
@@ -39,7 +40,10 @@ P = dict(vr=1.5, mv=0.004, regime=1.5, probe=0.25, add_gap=0.008, add_frac=0.25,
          time_stop_h=36, limit_bars=3)
 MAKER, TAKER, SLIP = 0.0002, 0.0005, 0.0003
 REGIME_WIN  = 30 * 288                 # 국면 분모: 30일 (D 버전, 2026-10-03 변경 — 이전 A 버전은 7일=2016봉)
-MIN_BARS    = REGIME_WIN + 288 + 50     # 지표가 유효해지는 최소 봉 수
+TREND_SD, TREND_LD = 10, 40            # T2 추세 필터: 코인별 10일 평균 > 40일 평균 × 1.015 (레짐봇과 같은 규칙)
+TIER_LOW    = 1.2                       # T2: 국면 1.2~1.5 & 상승 추세 → 절반 크기
+HALF        = 0.5
+MIN_BARS    = max(REGIME_WIN, TREND_LD * 288) + 288 + 50     # 지표가 유효해지는 최소 봉 수
 HIST_BARS   = MIN_BARS + 300            # 지표 계산용 5분봉
 BAR_MS      = 300_000
 DIR         = os.path.dirname(os.path.abspath(__file__))
@@ -48,7 +52,7 @@ TRADES_F    = os.path.join(DIR, "rebound_bot_trades.csv")
 EQUITY_F    = os.path.join(DIR, "rebound_bot_equity.csv")
 LOG_F       = os.path.join(DIR, "rebound_bot.log")
 # 백테스트 기대치 (리포트 비교용)
-BT_REF = dict(pf="1.22~1.35", win="63~64%", per_week="약 2회", cagr_1x="+7.7%", mdd_1x="-11.6%")
+BT_REF = dict(pf="1.32~1.43 (T2)", win="62~66%", per_week="매매일 주 1.5일", cagr_1x="+16% 안팎", mdd_1x="-12% 안팎")
 # ================================================
 
 log = logging.getLogger("rebound")
@@ -74,6 +78,22 @@ def features(df):
     return r15, vr, regime.fillna(0.0), sig15
 
 
+def trend_up(df):
+    """코인별 상승 추세 (백테스트 trend_sign 과 동일: 직전 봉까지의 판정)"""
+    c = df["close"]
+    s, lg = c.rolling(TREND_SD * 288).mean(), c.rolling(TREND_LD * 288).mean()
+    return (s > lg * 1.015).shift(1, fill_value=False)
+
+
+def tier_of(regime, up):
+    """T2 진입 크기 배수: 1.0 정상 / 0.5 절반 / 0 진입 안 함"""
+    if regime >= P["regime"]:
+        return 1.0
+    if regime >= TIER_LOW and up:
+        return HALF
+    return 0.0
+
+
 def scale_of(sig):
     if sig is None or not np.isfinite(sig) or BASE_SIG <= 0:
         return 1.0
@@ -83,7 +103,7 @@ def scale_of(sig):
 # ---------------- 코인별 엔진 (백테스트 simulate 한 봉 처리와 동일 순서) ----------------
 class Engine:
     FIELDS = ("equity", "qty", "avg", "cmax", "last_add", "sc", "cp", "t_in", "cs", "n_add",
-              "pend_entry", "pend_tp", "mkt")
+              "pend_entry", "pend_tp", "mkt", "cm")
 
     def __init__(self, coin, equity):
         self.coin = coin
@@ -91,6 +111,7 @@ class Engine:
         self.qty = self.avg = self.cmax = self.last_add = 0.0
         self.sc, self.cp, self.t_in, self.cs, self.n_add = 1.0, 0.0, None, None, 0
         self.pend_entry = self.pend_tp = self.mkt = None
+        self.cm = 1.0                            # 이번 사이클 크기 배수 (T2: 1.0 정상 / 0.5 절반)
         self.closed = []                         # 이번 봉에서 끝난 사이클 (저장 후 비움)
 
     # 상태 저장/복원
@@ -109,17 +130,18 @@ class Engine:
     def _close(self, t, why):
         self.closed.append(dict(coin=self.coin, start=self.cs, end=t, pnl=round(self.cp, 4),
                                 pnl_pct=round(self.cp / max(self.equity - self.cp, 1e-9) * 100, 3),
-                                reason=why, max_notional=round(self.cmax, 2), adds=self.n_add,
+                                reason=why, size=self.cm, max_notional=round(self.cmax, 2), adds=self.n_add,
                                 hold_h=round((t - self.cs) / 3_600_000, 2),
                                 equity_after=round(self.equity, 2)))
-        log.info(f"[{self.coin}] ■ 사이클 종료({why}) 손익 {self.cp:+.2f} USDT · 평가액 {self.equity:.2f}")
+        log.info(f"[{self.coin}] ■ 사이클 종료({why}, {'절반' if self.cm < 1 else '정상'} 크기) 손익 {self.cp:+.2f} USDT · 평가액 {self.equity:.2f}")
         self.qty = self.avg = self.cmax = 0.0
         self.pend_tp = None
 
     def step(self, bar, feat, funding_rate):
-        """bar: dict(ts, open, high, low, close) — 막 마감된 봉 / feat: 그 봉의 (r15, vr, regime, sig15)"""
+        """bar: dict(ts, open, high, low, close) — 막 마감된 봉 / feat: 그 봉의 (r15, vr, regime, sig15[, up])"""
         ts, o, h, l, c = bar["ts"], bar["open"], bar["high"], bar["low"], bar["close"]
-        r15, vr, regime, sig = feat
+        r15, vr, regime, sig = feat[:4]
+        up = bool(feat[4]) if len(feat) > 4 else False
         # ----- 이 봉에서 체결 처리 (결정은 직전 봉 종가에서 내려졌음) -----
         if self.inpos and self.mkt is not None:
             q = self.qty if self.mkt[0] == "all" else min(self.qty, self.mkt[1])
@@ -159,7 +181,7 @@ class Engine:
                         self.pend_tp = None
                 if self.inpos:
                     lvl = self.last_add * (1 - P["add_gap"] * self.sc)
-                    budget = self.equity * LEV
+                    budget = self.equity * LEV * self.cm
                     if l <= lvl and self.qty * lvl < budget:
                         px = min(o, lvl)
                         add = min(self.qty * P["add_frac"], (budget - self.qty * px) / px)
@@ -169,14 +191,16 @@ class Engine:
                             self.equity -= add * px * MAKER; self.cp -= add * px * MAKER
                             log.info(f"[{self.coin}] 추가 매수 {add:.4f} @ {px:.4f} → 평단 {self.avg:.4f}, 물량 {self.qty*px:.1f}")
         if not self.inpos and self.pend_entry is not None:
-            px, exp = self.pend_entry
+            px, exp = self.pend_entry[0], self.pend_entry[1]
+            m_ = self.pend_entry[2] if len(self.pend_entry) > 2 else 1.0
             if l <= px:
-                budget = self.equity * LEV
+                self.cm = m_
+                budget = self.equity * LEV * m_
                 self.qty = budget * P["probe"] / px; self.avg = px; self.last_add = px; self.cmax = self.qty * px
                 self.t_in, self.cs, self.sc, self.n_add = ts, ts, scale_of(sig), 0
                 self.cp = -self.qty * px * MAKER; self.equity += self.cp
                 self.pend_entry = None
-                log.info(f"[{self.coin}] ▶ 진입 체결 {self.qty:.4f} @ {px:.4f} (물량 {self.qty*px:.1f} USDT, 배율 {self.sc:.2f}, "
+                log.info(f"[{self.coin}] ▶ 진입 체결 [{'절반' if m_ < 1 else '정상'} 크기] {self.qty:.4f} @ {px:.4f} (물량 {self.qty*px:.1f} USDT, 배율 {self.sc:.2f}, "
                          f"손절선 -{min(P['stop']*self.sc, P['stop_cap'])*100:.1f}% / 전량익절 +{P['tp_max']*self.sc*100:.1f}%)")
             elif ts >= exp:
                 log.info(f"[{self.coin}] 진입 지정가 미체결 → 취소")
@@ -190,11 +214,12 @@ class Engine:
         s_now = scale_of(sig)
         burst = ok and vr >= P["vr"] and abs(r15) >= P["mv"] * s_now
         if not self.inpos:
-            if self.pend_entry is None and burst and regime >= P["regime"] and r15 < 0:
+            mult = tier_of(regime, up)
+            if self.pend_entry is None and burst and mult > 0 and r15 < 0:
                 exp = ts + P["limit_bars"] * BAR_MS
-                self.pend_entry = (c, exp)
-                log.info(f"[{self.coin}] ★ 급락 쏠림 신호 (15분 {r15*100:.2f}%, 거래량 {vr:.1f}배, 국면 {regime:.2f}) "
-                         f"→ 지정가 매수 {c:.4f} 대기(15분)")
+                self.pend_entry = (c, exp, mult)
+                log.info(f"[{self.coin}] ★ 급락 쏠림 신호 [{'절반' if mult < 1 else '정상'} 크기] (15분 {r15*100:.2f}%, 거래량 {vr:.1f}배, "
+                         f"국면 {regime:.2f}, 추세 {'상승' if up else '비상승'}) → 지정가 매수 {c:.4f} 대기(15분)")
         else:
             un = c / self.avg - 1
             if (ts - self.t_in) / 3_600_000 >= P["time_stop_h"] and un < 0:
@@ -299,7 +324,7 @@ def append_csv(path, rows):
 def run():
     setup_log()
     log.info("=" * 70)
-    log.info(f"리바운드 전략 드라이런 시작 [D 버전: 국면 = 24h ÷ {REGIME_WIN//288}일] — 코인 {list(SYMBOLS)} · 원금 {PRINCIPAL:.1f} USDT(반반) · 기록 레버리지 {LEV:g}배")
+    log.info(f"리바운드 전략 드라이런 시작 [T2 버전: 국면 24h÷{REGIME_WIN//288}일 · 1.5↑ 정상 / {TIER_LOW}~1.5 & 상승추세({TREND_SD}/{TREND_LD}일) 절반] — 코인 {list(SYMBOLS)} · 원금 {PRINCIPAL:.1f} USDT(반반) · 기록 레버리지 {LEV:g}배")
     feed = Feed()
     st = load_state()
     engines = {k: Engine(k, PRINCIPAL / len(SYMBOLS)) for k in SYMBOLS}
@@ -319,6 +344,7 @@ def run():
                 if len(df) < MIN_BARS:
                     log.info(f"[{k}] 이력 부족({len(df)}봉) — 대기"); continue
                 r15, vr, regime, sig = features(df)
+                upser = trend_up(df)
                 # 처리할 새 봉: last_ts 이후 마감된 봉 전부 (재시작 시 놓친 봉 따라잡기)
                 start = 0 if last_ts[k] is None else int(np.searchsorted(df["ts"].values, last_ts[k], side="right"))
                 if last_ts[k] is None:
@@ -332,7 +358,7 @@ def run():
                     if t.minute == 0 and t.hour % 8 == 0:          # 정산 봉: 이 봉에서 진입해도 펀딩 대상
                         fr = feed.funding(sym, ts)
                     mtm = engines[k].step(dict(ts=ts, open=row["open"], high=row["high"], low=row["low"], close=row["close"]),
-                                          (r15.iloc[i], vr.iloc[i], regime.iloc[i], sig.iloc[i]), fr)
+                                          (r15.iloc[i], vr.iloc[i], regime.iloc[i], sig.iloc[i], upser.iloc[i]), fr)
                     last_ts[k] = ts
                     append_csv(TRADES_F, engines[k].closed); engines[k].closed = []
                 if mtm is not None:
@@ -374,6 +400,10 @@ def report():
     print(f"평균 이익 {w.mean() if len(w) else 0:+.2f} / 평균 손실 {l.mean() if len(l) else 0:+.2f} USDT · 보유 중앙 {t.hold_h.median():.1f}h")
     print(t.groupby("coin").pnl.agg(회수="size", 합계="sum", 승률=lambda x: f"{(x>0).mean()*100:.0f}%").to_string())
     print("\n종료 사유"); print(t.groupby("reason").pnl.agg(회수="size", 평균="mean").round(2).to_string())
+    if "size" in t.columns:
+        g = t.assign(크기=np.where(t["size"] < 1, "절반", "정상")).groupby("크기").pnl
+        print("\n크기별"); print(pd.DataFrame({"회수": g.size(), "합계": g.sum().round(2),
+              "PF": g.apply(lambda x: round(x[x > 0].sum() / -x[x <= 0].sum(), 2) if (x <= 0).any() and x[x <= 0].sum() < 0 else float("nan"))}).to_string())
     print(f"\n레버리지 근사 (1배 기록 × 배수, 복리·한도 효과 제외): 2배 {t.pnl.sum()*2/PRINCIPAL*100:+.2f}% · 3배 {t.pnl.sum()*3/PRINCIPAL*100:+.2f}%")
     if os.path.exists(EQUITY_F):
         e = pd.read_csv(EQUITY_F)
