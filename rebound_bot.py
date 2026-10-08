@@ -41,6 +41,7 @@ P = dict(vr=1.5, mv=0.004, regime=1.5, probe=0.25, add_gap=0.008, add_frac=0.25,
 MAKER, TAKER, SLIP = 0.0002, 0.0005, 0.0003
 REGIME_WIN  = 30 * 288                 # 국면 분모: 30일 (D 버전, 2026-10-03 변경 — 이전 A 버전은 7일=2016봉)
 TREND_SD, TREND_LD = 10, 40            # T2 추세 필터: 코인별 10일 평균 > 40일 평균 × 1.015 (레짐봇과 같은 규칙)
+STRICT      = 0.0001                    # 가상 지정가 체결: 가격이 1bp 이상 '뚫고 지나가야' 체결 (대기열 고려, 2026-10-09)
 TIER_LOW    = 1.2                       # T2: 국면 1.2~1.5 & 상승 추세 → 절반 크기
 HALF        = 0.5
 MIN_BARS    = max(REGIME_WIN, TREND_LD * 288) + 288 + 50     # 지표가 유효해지는 최소 봉 수
@@ -162,7 +163,7 @@ class Engine:
                 self.equity += pnl; self.cp += pnl
                 log.info(f"[{self.coin}] 전량 손절 @ {px:.4f} ({pnl:+.2f})")
                 self._close(ts, "전량손절")
-            elif h >= tpx:
+            elif h > tpx * (1 + STRICT):
                 pnl = self.qty * (tpx - self.avg) - self.qty * tpx * MAKER
                 self.equity += pnl; self.cp += pnl
                 log.info(f"[{self.coin}] 전량 익절 @ {tpx:.4f} ({pnl:+.2f})")
@@ -170,7 +171,7 @@ class Engine:
             else:
                 if self.pend_tp is not None:
                     px, q, exp = self.pend_tp
-                    if h >= px:
+                    if h > px * (1 + STRICT):
                         q = min(q, self.qty)
                         pnl = q * (px - self.avg) - q * px * MAKER
                         self.equity += pnl; self.cp += pnl; self.qty -= q; self.pend_tp = None
@@ -182,7 +183,7 @@ class Engine:
                 if self.inpos:
                     lvl = self.last_add * (1 - P["add_gap"] * self.sc)
                     budget = self.equity * LEV * self.cm
-                    if l <= lvl and self.qty * lvl < budget:
+                    if l < lvl * (1 - STRICT) and self.qty * lvl < budget:
                         px = min(o, lvl)
                         add = min(self.qty * P["add_frac"], (budget - self.qty * px) / px)
                         if add > 0:
@@ -193,7 +194,7 @@ class Engine:
         if not self.inpos and self.pend_entry is not None:
             px, exp = self.pend_entry[0], self.pend_entry[1]
             m_ = self.pend_entry[2] if len(self.pend_entry) > 2 else 1.0
-            if l <= px:
+            if l < px * (1 - STRICT):
                 self.cm = m_
                 budget = self.equity * LEV * m_
                 self.qty = budget * P["probe"] / px; self.avg = px; self.last_add = px; self.cmax = self.qty * px
@@ -285,6 +286,19 @@ class Feed:
         self.cache[symbol] = df
         return df
 
+    def funding_map(self, symbol, t0_ms, t1_ms):
+        """t0~t1 사이 실제 정산 기록 → {정산 시각을 5분 내림한 봉 시작 ms: 펀딩비}. 정산 주기가 바뀌어도 맞음 (백테스트와 같은 방식)"""
+        try:
+            fr = http_get("/fapi/v1/fundingRate", {"symbol": symbol, "startTime": t0_ms, "endTime": t1_ms, "limit": 1000}) or []
+            out = {}
+            for f in fr:
+                k = int(f["fundingTime"]) // BAR_MS * BAR_MS
+                out[k] = out.get(k, 0.0) + float(f["fundingRate"])
+            return out
+        except Exception as e:
+            log.info(f"[경고] 펀딩 기록 조회 실패 {symbol}: {e} — 8시간 정산 가정(0.01%)")
+            return None
+
     def funding(self, symbol, ts_ms):
         """정산 시각(ts_ms)의 실제 펀딩비. 실패 시 0.01% (롱에 불리하게) 가정"""
         try:
@@ -338,7 +352,7 @@ def run():
     last_eq_hour = None
     while True:
         try:
-            eq_row = {"ts": None}
+            eq_row = {"ts": None}; near = {}
             for k, sym in SYMBOLS.items():
                 df = feed.ohlcv(sym)
                 if len(df) < MIN_BARS:
@@ -350,17 +364,21 @@ def run():
                 if last_ts[k] is None:
                     start = len(df) - 1                      # 첫 실행은 최신 봉부터
                 mtm = None
-                for i in range(max(start, MIN_BARS), len(df)):
+                i0 = max(start, MIN_BARS)
+                fmap = feed.funding_map(sym, int(df["ts"].iloc[i0]) - BAR_MS, int(df["ts"].iloc[-1]) + BAR_MS) if i0 < len(df) else {}
+                for i in range(i0, len(df)):
                     row = df.iloc[i]
                     ts = int(row["ts"])
-                    fr = 0.0
-                    t = pd.Timestamp(ts, unit="ms", tz="UTC")
-                    if t.minute == 0 and t.hour % 8 == 0:          # 정산 봉: 이 봉에서 진입해도 펀딩 대상
-                        fr = feed.funding(sym, ts)
+                    if fmap is not None:
+                        fr = fmap.get(ts, 0.0)                     # 실제 정산 시각 기준
+                    else:                                          # 조회 실패 시 예전 방식(8시간 정산, 0.01%)
+                        t = pd.Timestamp(ts, unit="ms", tz="UTC")
+                        fr = 0.0001 if (t.minute == 0 and t.hour % 8 == 0) else 0.0
                     mtm = engines[k].step(dict(ts=ts, open=row["open"], high=row["high"], low=row["low"], close=row["close"]),
                                           (r15.iloc[i], vr.iloc[i], regime.iloc[i], sig.iloc[i], upser.iloc[i]), fr)
                     last_ts[k] = ts
                     append_csv(TRADES_F, engines[k].closed); engines[k].closed = []
+                near[k] = (float(r15.iloc[-1]), float(vr.iloc[-1]), float(regime.iloc[-1]), scale_of(sig.iloc[-1]), bool(upser.iloc[-1]))
                 if mtm is not None:
                     eq_row[k] = round(mtm, 3); eq_row["ts"] = pd.Timestamp(last_ts[k], unit="ms", tz="UTC").isoformat()
             save_state(engines, last_ts)
@@ -370,6 +388,9 @@ def run():
                 append_csv(EQUITY_F, [eq_row]); last_eq_hour = hr
                 pos = ", ".join(f"{k} {'보유 ' + format(e.qty*e.avg, '.0f') + 'USDT' if e.inpos else '대기'}" for k, e in engines.items())
                 log.info(f"[시간 요약] 합계 평가액 {eq_row['total']:.2f} USDT · {pos}")
+                for k, (a, b, c_, d_, e_) in near.items():
+                    log.info(f"   [{k}] 15분 {a*100:+.2f}% (기준 {-P['mv']*d_*100:.2f}%) · 거래량 {b:.1f}배 (기준 {P['vr']}) · "
+                             f"국면 {c_:.2f} (정상 {P['regime']} / 절반 {TIER_LOW}+상승) · 추세 {'상승' if e_ else '비상승'}")
         except Exception as e:
             log.info(f"[오류] {type(e).__name__}: {e} — 60초 후 재시도")
             time.sleep(60)

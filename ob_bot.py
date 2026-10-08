@@ -23,6 +23,7 @@
 명령
   venv/bin/python ob_bot.py            # 실행
   venv/bin/python ob_bot.py --report   # 성적표
+  venv/bin/python ob_bot.py --verify 2026-10-07   # 그날 공식 파일 vs 실시간 계산 비교 (손으로)
 """
 
 import os, sys, io, json, time, math, zipfile, logging, datetime as dt
@@ -300,7 +301,10 @@ def run():
         calc.vols.append(x["volume"])
     for end in range(last_ts + BAR_MS - (Z_WIN - 1) * BAR_MS, last_ts + BAR_MS + 1, BAR_MS):   # 봉 끝 시각 기준
         calc.imbs.append(hist.get(end, np.nan))
-    last_depth = 0; last_verify = st.get("last_verify"); last_hour = None
+    last_depth = 0; last_hour = None; verify_try = 0
+    verified = list(st.get("verified", []))
+    live_start = (pd.Timestamp(int(pd.read_csv(F_LIVE, nrows=1)["ts"].iloc[0]), unit="ms", tz="UTC").date()
+                  if os.path.exists(F_LIVE) else dt.datetime.now(dt.timezone.utc).date())
     live_buf = []; recent = deque(maxlen=600)                 # 최근 5시간 실시간 호가 (메모리)
     while True:
         try:
@@ -333,7 +337,7 @@ def run():
                         last_ts = bar["ts"]
                     append_csv(F_TRADES, eng.closed); eng.closed = []
                     save_imb_history(hist)
-                    save_state(dict(last_ts=last_ts, engine=eng.to_dict(), last_verify=last_verify))
+                    save_state(dict(last_ts=last_ts, engine=eng.to_dict(), verified=verified))
                     hr = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H")
                     if hr != last_hour:
                         last_hour = hr
@@ -342,17 +346,22 @@ def run():
                         extra = f" · 호가 z {zv:.2f} · 거래량 {vr:.1f}배" if (zv == zv and vr == vr) else " · 호가 z 계산 전(이력 부족)"
                         log.info(f"[시간 요약] 평가액 {eng.equity:.2f} USDT · {stat}{extra}")
                         append_csv(F_EQ, [dict(ts=now, equity=round(eng.equity, 4), holding=int(eng.pos is not None))])
-            # 매일 어제 공식 파일과 대조 (UTC 06시 이후, 실패하면 다음 날 다시)
-            utc = dt.datetime.now(dt.timezone.utc)
-            yday = str(utc.date() - dt.timedelta(days=1))
-            if utc.hour >= 6 and last_verify != yday:
-                v = verify_day(utc.date() - dt.timedelta(days=1))
-                if v:
-                    append_csv(F_VER, [v]); last_verify = yday
-                    log.info(f"[검증] {yday} 공식 vs 실시간 — 상관 {v['corr']:.3f} · 평균 차이 {v['mean_abs_diff']:.4f} · "
-                             f"매수 금액 비율 {v['bid_level_ratio']} ({v['n']}개 봉)")
-                elif utc.hour >= 12:
-                    last_verify = yday                       # 그날은 포기 (실시간 기록이 없던 날 등)
+            # 공식 파일과 대조 — 검증 안 된 최근 3일을 1시간마다 시도 (공식 파일은 하루 늦게, 가끔 더 늦게 올라옴)
+            if now - verify_try >= 3_600_000:
+                verify_try = now
+                today = dt.datetime.now(dt.timezone.utc).date()
+                for back in (3, 2, 1):
+                    day = today - dt.timedelta(days=back)
+                    if str(day) in verified or day < live_start:
+                        continue
+                    v = verify_day(day)
+                    if v:
+                        append_csv(F_VER, [v]); verified.append(str(day)); verified[:] = verified[-30:]
+                        log.info(f"[검증] {day} 공식 vs 실시간 — 상관 {v['corr']:.3f} · 평균 차이 {v['mean_abs_diff']:.4f} · "
+                                 f"매수 금액 비율 {v['bid_level_ratio']} ({v['n']}개 봉)")
+                    elif back == 1:
+                        log.info(f"[검증] {day} 공식 파일 아직 없음(또는 비교할 실시간 기록 부족) — 1시간 뒤 재시도")
+                save_state(dict(last_ts=last_ts, engine=eng.to_dict(), verified=verified))
             time.sleep(5)
         except Exception as e:
             log.info(f"[오류] {type(e).__name__}: {e} — 60초 후 재시도")
@@ -390,7 +399,12 @@ def report():
 
 
 if __name__ == "__main__":
-    if "--report" in sys.argv:
+    if "--verify" in sys.argv:                      # 손으로 검증: venv/bin/python ob_bot.py --verify 2026-10-07
+        d = sys.argv[sys.argv.index("--verify") + 1] if len(sys.argv) > sys.argv.index("--verify") + 1 else \
+            str(dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1))
+        v = verify_day(dt.date.fromisoformat(d))
+        print(v if v else f"{d}: 공식 파일이 아직 없거나, 그날 실시간 기록이 부족함")
+    elif "--report" in sys.argv:
         report()
     else:
         run()
