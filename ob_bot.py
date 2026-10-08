@@ -7,7 +7,9 @@
   코인   : XRPUSDT (USD-M 무기한)
   신호   : 5분봉이 끝난 순간 — 그 봉 거래량 ≥ 직전 24시간(288봉) 평균의 3배
            & ±1% 호가 불균형 (매수금액−매도금액)/(합) 의 30일 z점수 ≤ -2  (매도 호가가 두꺼움)
-  진입   : 다음 5분봉 시가에 시장가 (가상: 수수료 0.05% + 슬리피지 0.03%)
+  진입   : D 분할 (2026-10-09) — 최대 물량의 1/3 을 다음 5분봉 시가에 시장가(0.05% + 슬리피지 0.03%),
+           나머지 1/3 씩은 첫 진입가 -1% / -2% 에 지정가(0.02%, 가격이 1bp 이상 뚫고 지나가야 체결)
+           4시간 안에 안 걸린 추가분은 청산 때 취소
   청산   : 진입 4시간 뒤 — 그 순간 가격에 지정가 매도, 다음 5분 안에 가격이 뚫고 지나가면 체결(수수료 0.02%),
            아니면 그다음 봉 시가에 시장가.  손절 없음.  보유 중 새 신호는 무시
   펀딩   : 실제 펀딩비 (보유 중 지나는 정산마다 롱이 지불)
@@ -46,7 +48,9 @@ FAPI = "https://fapi.binance.com"
 BV = "https://data.binance.vision/data/futures/um/daily/bookDepth"
 F_STATE, F_TRADES, F_EQ = "ob_bot_state.json", "ob_bot_trades.csv", "ob_bot_equity.csv"
 F_LIVE, F_IMB, F_VER, F_LOG = "ob_depth_live.csv", "ob_imb_5m.csv", "ob_verify.csv", "ob_bot.log"
-BT_REF = dict(pf="1.41~1.59", win="53%", per_week="약 3회", avg="+0.31%/회(1배)")
+BT_REF = dict(pf="1.66~2.14 (D 분할)", win="60% 안팎", per_week="약 3회", avg="+0.31%/회(1배, 최대 물량 기준)")
+PLAN = [(1 / 3, 0.0), (1 / 3, 0.01), (1 / 3, 0.02)]      # D 분할: (비중, 첫 진입가 대비 하락폭)
+STRICT = 0.0001
 
 log = logging.getLogger("ob")
 
@@ -143,37 +147,40 @@ class SignalCalc:
 
 # ---------------------------------------------------------------- 가상 매매 엔진 (백테스트 simulate 와 같은 순서)
 class Engine:
-    FIELDS = ("equity", "pos", "pending", "exit_stage", "lim", "fund_cum", "last_close")
+    FIELDS = ("equity", "pos", "pending", "exit_stage", "lim", "last_close")
 
     def __init__(self, equity):
         self.equity = equity
-        self.pos = None            # dict(t_in, px_in, k_ts)  k_ts = 4시간 되는 봉의 시작 시각
+        self.pos = None            # dict(t_in, k_ts, p0, fills=[[비중, 가격, 체결봉 시작ms, 수수료, 펀딩누적]], adds=[[비중, 가격]], bar, z, vr)
         self.pending = None        # 신호 정보 (다음 봉에서 진입)
         self.exit_stage = None     # None / "fallback" (지정가 실패 → 다음 봉 시가 시장가)
         self.lim = None
-        self.fund_cum = 0.0
         self.last_close = None
         self.closed = []
 
-    def _close(self, t_out, px_out, cost, why):
+    def _close(self, t_out, px_out, xfee, why):
         p = self.pos
-        r = px_out / p["px_in"] - 1 - TAKER - cost - self.fund_cum
+        r = sum(f * (px_out / px - 1 - fee - xfee - fc) for f, px, _, fee, fc in p["fills"])
         pnl = self.equity * LEV * r
         self.equity += pnl
-        self.closed.append(dict(entry_time=p["t_in"], exit_time=t_out, entry=round(p["px_in"], 5), exit=round(px_out, 5),
-                                ret_pct=round(r * 100, 4), pnl=round(pnl, 4), funding_pct=round(self.fund_cum * 100, 4),
+        used = sum(f for f, *_ in p["fills"])
+        self.closed.append(dict(entry_time=p["t_in"], exit_time=t_out, entry=round(p["p0"], 5), exit=round(px_out, 5),
+                                ret_pct=round(r * 100, 4), pnl=round(pnl, 4), used_pct=round(used * 100, 1),
+                                adds=len(p["fills"]) - 1, funding_pct=round(sum(f * fc for f, _, _, _, fc in p["fills"]) * 100, 4),
                                 reason=why, bar=p.get("bar", ""), z=p.get("z"), vr=p.get("vr")))
-        log.info(f"■ 청산({why}) {p['px_in']:.4f} → {px_out:.4f}  수익 {r*100:+.2f}% · 평가액 {self.equity:.2f}")
-        self.pos = None; self.exit_stage = None; self.lim = None; self.fund_cum = 0.0
+        log.info(f"■ 청산({why}) 물량 {used*100:.0f}% · 수익 {r*100:+.2f}%(최대 물량 기준) · 평가액 {self.equity:.2f}")
+        self.pos = None; self.exit_stage = None; self.lim = None
 
     def step(self, bar, vr, zv, sig, fundings):
         """bar: 막 마감된 5분봉 dict(ts=시작ms, open, high, low, close)"""
-        ts, o, h = bar["ts"], bar["open"], bar["high"]
+        ts, o, h, l = bar["ts"], bar["open"], bar["high"], bar["low"]
         just_exited = False
         if self.pos is not None:
-            for ft, rate in fundings:                       # 직전 봉 시작 ~ 이 봉 시작 사이에 지난 정산 (한 번씩만)
-                if self.pos["t_in"] < ft <= ts and ft > ts - BAR_MS:
-                    self.fund_cum += rate
+            for ft, rate in fundings:                       # 직전 봉 시작 ~ 이 봉 시작 사이 정산: 그 전에 체결된 분량만
+                if ts - BAR_MS < ft <= ts:
+                    for fl in self.pos["fills"]:
+                        if fl[2] < ft:
+                            fl[4] += rate
             if self.exit_stage == "fallback":
                 self._close(ts, o * (1 - SLIP), TAKER, "시간(지정가 실패→시장가)"); just_exited = True
             elif ts == self.pos["k_ts"]:
@@ -184,12 +191,24 @@ class Engine:
                     self.exit_stage = "fallback"
         if self.pos is None and not just_exited and self.pending is not None:
             px = o * (1 + SLIP)
-            self.pos = dict(t_in=ts, px_in=px, k_ts=ts + HOLD * BAR_MS, **self.pending)
-            log.info(f"▶ 진입 {px:.4f} ({self.pending['bar']}에서 신호, z {self.pending['z']:.2f}, 거래량 {self.pending['vr']:.1f}배)")
+            self.pos = dict(t_in=ts, k_ts=ts + HOLD * BAR_MS, p0=px, fills=[[PLAN[0][0], px, ts, TAKER, 0.0]],
+                            adds=[[f, px * (1 - d)] for f, d in PLAN[1:]], **self.pending)
+            log.info(f"▶ 진입 1/3 {px:.4f} ({self.pending['bar']}에서 신호, z {self.pending['z']:.2f}, 거래량 {self.pending['vr']:.1f}배) "
+                     f"· 추가 지정가 {', '.join(f'{a[1]:.4f}' for a in self.pos['adds'])}")
         self.pending = None
+        if self.pos is not None and self.exit_stage is None and ts < self.pos["k_ts"]:   # 보유 중(청산 봉 전) 추가분 체결
+            still = []
+            for f, lvl in self.pos["adds"]:
+                if l < lvl * (1 - STRICT):
+                    fp = min(o, lvl)
+                    self.pos["fills"].append([f, fp, ts, MAKER, 0.0])
+                    log.info(f"  + 추가 1/3 체결 {fp:.4f}")
+                else:
+                    still.append([f, lvl])
+            self.pos["adds"] = still
         if sig and self.pos is None:
             self.pending = dict(bar="상승봉" if bar["close"] > o else "하락봉", z=round(float(zv), 3), vr=round(float(vr), 2))
-            log.info(f"★ 신호 — 거래량 {vr:.1f}배 · 호가 z {zv:.2f} · {self.pending['bar']} → 다음 봉 시가 진입")
+            log.info(f"★ 신호 — 거래량 {vr:.1f}배 · 호가 z {zv:.2f} · {self.pending['bar']} → 다음 봉 시가 1/3 진입")
         elif sig:
             log.info(f"☆ 신호(보유 중이라 무시) — 거래량 {vr:.1f}배 · 호가 z {zv:.2f}")
         self.last_close = bar["close"]
@@ -201,6 +220,10 @@ class Engine:
         for k in self.FIELDS:
             if k in d:
                 setattr(self, k, d[k])
+        if self.pos is not None and "fills" not in self.pos:          # 예전(A) 형식 보유분이 있으면 D 형식으로 변환
+            self.pos = dict(t_in=self.pos["t_in"], k_ts=self.pos["k_ts"], p0=self.pos["px_in"],
+                            fills=[[1.0, self.pos["px_in"], self.pos["t_in"], TAKER, 0.0]], adds=[],
+                            bar=self.pos.get("bar", ""), z=self.pos.get("z"), vr=self.pos.get("vr"))
 
 
 # ---------------------------------------------------------------- 저장
@@ -280,7 +303,7 @@ def run():
     calc = SignalCalc()
     hist = load_imb_history()
     log.info("=" * 70)
-    log.info(f"오더북 리바운드(S4) 드라이런 시작 — {SYMBOL} · 원금 {eng.equity:.1f} USDT · 기록 배율 {LEV:g}배")
+    log.info(f"오더북 리바운드(S4) 드라이런 시작 [D 분할: 1/3 시장가 + -1%·-2% 지정가] — {SYMBOL} · 원금 {eng.equity:.1f} USDT · 기록 배율 {LEV:g}배")
     n = seed_official(hist)
     log.info(f"호가 불균형 이력 {len(hist):,}개 (공식 파일로 {n}일 채움)")
     save_imb_history(hist)
@@ -341,7 +364,7 @@ def run():
                     hr = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H")
                     if hr != last_hour:
                         last_hour = hr
-                        unreal = (bars[-1]["close"] / eng.pos["px_in"] - 1) * 100 if eng.pos else None
+                        unreal = (sum(f * (bars[-1]["close"] / px - 1) for f, px, *_ in eng.pos["fills"]) * 100) if eng.pos else None
                         stat = f"보유 중 {unreal:+.2f}%" if eng.pos else "대기"
                         extra = f" · 호가 z {zv:.2f} · 거래량 {vr:.1f}배" if (zv == zv and vr == vr) else " · 호가 z 계산 전(이력 부족)"
                         log.info(f"[시간 요약] 평가액 {eng.equity:.2f} USDT · {stat}{extra}")
@@ -376,7 +399,8 @@ def report():
     print(f"평가액(실현 기준): {eq:.2f} USDT (시작 {PRINCIPAL:.2f}) → {(eq / PRINCIPAL - 1) * 100:+.2f}%")
     if st.get("engine", {}).get("pos"):
         p = st["engine"]["pos"]
-        print(f"  보유 중: 진입 {p['px_in']:.4f} ({pd.Timestamp(p['t_in'], unit='ms', tz='Asia/Seoul'):%m-%d %H:%M})")
+        print(f"  보유 중: 첫 진입 {p['p0']:.4f} ({pd.Timestamp(p['t_in'], unit='ms', tz='Asia/Seoul'):%m-%d %H:%M}) · "
+              f"체결 {len(p['fills'])}/3 · 남은 추가 지정가 {', '.join(f'{a[1]:.4f}' for a in p['adds']) or '없음'}")
     if os.path.exists(F_TRADES):
         t = pd.read_csv(F_TRADES)
         r = t["ret_pct"] / 100
@@ -388,7 +412,9 @@ def report():
         print("\n신호 봉별 (백테스트: 하락봉 PF 2.63 · 상승봉 PF 1.11)")
         print(pd.DataFrame({"회수": g.size(), "평균%": g.mean().round(3), "합계%": g.sum().round(2)}).to_string())
         print("\n청산 방식"); print(t["reason"].value_counts().to_string())
-        print(f"\n레버리지 근사: 2배 {(r * 2).sum()*100:+.1f}% · 3배 {(r * 3).sum()*100:+.1f}%")
+        if "used_pct" in t.columns:
+            print(f"\n분할: 평균 실제 물량 {t['used_pct'].mean():.0f}% · 추가분 체결률 {t['adds'].sum() / (len(t) * 2) * 100:.0f}% (백테스트: 59% · 40% 안팎)")
+        print(f"\n배율 환산 (목표 1.5배): {(r * 1.5).sum()*100:+.1f}%  · 참고 1배 {r.sum()*100:+.1f}%")
     else:
         print("\n아직 끝난 매매 없음")
     if os.path.exists(F_VER):
