@@ -406,7 +406,7 @@ def run():
                                  f"실시간 {v.get('live_rows', 0)}행 · 겹치는 봉 {v.get('overlap', 0)}개 (2시간 미만이라 비교 불가)")
                     elif (str(day), str(today)) not in miss_logged:
                         miss_logged.add((str(day), str(today)))
-                        log.info(f"[검증] {day} 공식 파일 아직 안 올라옴 — 1시간마다 재시도 ({8 - back}일째 기다리는 중, 7일까지)")
+                        log.info(f"[검증] {day} 공식 파일 아직 안 올라옴 — 1시간마다 재시도 ({back}일째 기다리는 중, 7일까지)")
                 save_state(dict(last_ts=last_ts, engine=eng.to_dict(), verified=verified))
             time.sleep(5)
         except Exception as e:
