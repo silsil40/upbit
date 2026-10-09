@@ -150,6 +150,7 @@ class Engine:
     FIELDS = ("equity", "pos", "pending", "exit_stage", "lim", "last_close")
 
     def __init__(self, equity):
+        self.cur_bidr = None       # 이번 봉 끝 매수 호가(±1%) ÷ 직전 1시간 평균 — 기록용 (매매엔 영향 없음)
         self.equity = equity
         self.pos = None            # dict(t_in, k_ts, p0, fills=[[비중, 가격, 체결봉 시작ms, 수수료, 펀딩누적]], adds=[[비중, 가격]], bar, z, vr)
         self.pending = None        # 신호 정보 (다음 봉에서 진입)
@@ -167,7 +168,7 @@ class Engine:
         self.closed.append(dict(entry_time=p["t_in"], exit_time=t_out, entry=round(p["p0"], 5), exit=round(px_out, 5),
                                 ret_pct=round(r * 100, 4), pnl=round(pnl, 4), used_pct=round(used * 100, 1),
                                 adds=len(p["fills"]) - 1, funding_pct=round(sum(f * fc for f, _, _, _, fc in p["fills"]) * 100, 4),
-                                reason=why, bar=p.get("bar", ""), z=p.get("z"), vr=p.get("vr")))
+                                reason=why, bar=p.get("bar", ""), z=p.get("z"), vr=p.get("vr"), bidr=p.get("bidr")))
         log.info(f"■ 청산({why}) 물량 {used*100:.0f}% · 수익 {r*100:+.2f}%(최대 물량 기준) · 평가액 {self.equity:.2f}")
         self.pos = None; self.exit_stage = None; self.lim = None
 
@@ -207,8 +208,11 @@ class Engine:
                     still.append([f, lvl])
             self.pos["adds"] = still
         if sig and self.pos is None:
-            self.pending = dict(bar="상승봉" if bar["close"] > o else "하락봉", z=round(float(zv), 3), vr=round(float(vr), 2))
-            log.info(f"★ 신호 — 거래량 {vr:.1f}배 · 호가 z {zv:.2f} · {self.pending['bar']} → 다음 봉 시가 1/3 진입")
+            br = self.cur_bidr
+            self.pending = dict(bar="상승봉" if bar["close"] > o else "하락봉", z=round(float(zv), 3), vr=round(float(vr), 2),
+                                bidr=(round(float(br), 3) if br is not None else None))
+            btxt = f" · 매수호가 직전1시간 대비 {br*100:.0f}%{' (증발형)' if br <= 0.8 else ''}" if br is not None else " · 매수호가 변화 미기록"
+            log.info(f"★ 신호 — 거래량 {vr:.1f}배 · 호가 z {zv:.2f} · {self.pending['bar']}{btxt} → 다음 봉 시가 1/3 진입")
         elif sig:
             log.info(f"☆ 신호(보유 중이라 무시) — 거래량 {vr:.1f}배 · 호가 z {zv:.2f}")
         self.last_close = bar["close"]
@@ -330,10 +334,11 @@ def run():
     for end in range(last_ts + BAR_MS - (Z_WIN - 1) * BAR_MS, last_ts + BAR_MS + 1, BAR_MS):   # 봉 끝 시각 기준
         calc.imbs.append(hist.get(end, np.nan))
     last_depth = 0; last_hour = None; verify_try = 0
-    verified = list(st.get("verified", []))
+    verified = list(st.get("verified", [])); miss_logged = set()
     live_start = (pd.Timestamp(int(pd.read_csv(F_LIVE, nrows=1)["ts"].iloc[0]), unit="ms", tz="UTC").date()
                   if os.path.exists(F_LIVE) else dt.datetime.now(dt.timezone.utc).date())
     live_buf = []; recent = deque(maxlen=600)                 # 최근 5시간 실시간 호가 (메모리)
+    bid_end = {}                                              # 봉 끝 시각 → 그 봉 마지막 매수 금액(±1%)
     while True:
         try:
             now = int(time.time() * 1000)
@@ -355,9 +360,16 @@ def run():
                         end = bar["ts"] + BAR_MS
                         w = [x for x in recent if end - BAR_MS < x[0] <= end]       # 그 봉 안의 마지막 스냅샷
                         imb = None
+                        eng.cur_bidr = None
                         if w:
                             _, b1_, a1_ = w[-1]; imb = (b1_ - a1_) / (b1_ + a1_)
                             hist[end] = float(imb)
+                            prevb = [bid_end[k] for k in range(end - 12 * BAR_MS, end, BAR_MS) if k in bid_end]
+                            if len(prevb) >= 6:
+                                eng.cur_bidr = b1_ / (sum(prevb) / len(prevb))
+                            bid_end[end] = b1_
+                            for k in [k for k in bid_end if k < end - 30 * BAR_MS]:
+                                del bid_end[k]
                         elif end in hist:
                             imb = hist[end]
                         vr, zv, sig = calc.push(bar["volume"], imb)
@@ -378,7 +390,7 @@ def run():
             if now - verify_try >= 3_600_000:
                 verify_try = now
                 today = dt.datetime.now(dt.timezone.utc).date()
-                for back in (3, 2, 1):
+                for back in range(7, 0, -1):                          # 최근 7일 (바이낸스가 며칠 늦게 올리는 경우 대비)
                     day = today - dt.timedelta(days=back)
                     if str(day) in verified or day < live_start:
                         continue
@@ -392,8 +404,9 @@ def run():
                         verified.append(str(day)); verified[:] = verified[-30:]           # 다시 시도해도 같으니 건너뜀
                         log.info(f"[검증] {day} 건너뜀 — 공식 파일 5분봉 {v.get('off_bars', 0)}개({v.get('off_span', '-')} UTC) · "
                                  f"실시간 {v.get('live_rows', 0)}행 · 겹치는 봉 {v.get('overlap', 0)}개 (2시간 미만이라 비교 불가)")
-                    elif back == 1:
-                        log.info(f"[검증] {day} 공식 파일 아직 안 올라옴 — 1시간 뒤 재시도")
+                    elif (str(day), str(today)) not in miss_logged:
+                        miss_logged.add((str(day), str(today)))
+                        log.info(f"[검증] {day} 공식 파일 아직 안 올라옴 — 1시간마다 재시도 ({8 - back}일째 기다리는 중, 7일까지)")
                 save_state(dict(last_ts=last_ts, engine=eng.to_dict(), verified=verified))
             time.sleep(5)
         except Exception as e:
@@ -422,6 +435,13 @@ def report():
         print("\n신호 봉별 (백테스트: 하락봉 PF 2.63 · 상승봉 PF 1.11)")
         print(pd.DataFrame({"회수": g.size(), "평균%": g.mean().round(3), "합계%": g.sum().round(2)}).to_string())
         print("\n청산 방식"); print(t["reason"].value_counts().to_string())
+        if "bidr" in t.columns:
+            br = pd.to_numeric(t["bidr"], errors="coerce")
+            cat = pd.Series(np.select([br <= 0.6, br <= 0.7, br <= 0.8, br > 0.8], ["증발 ≤60%", "60~70%", "70~80%", "그 외 >80%"], "미기록"),
+                            index=t.index)
+            g2 = t.groupby(cat)["ret_pct"]
+            print("\n매수 호가 변화율별 (백테스트: 증발 ≤80% PF 2.56 · 그 외 PF 1.54 안팎)")
+            print(pd.DataFrame({"회수": g2.size(), "평균%": g2.mean().round(3), "합계%": g2.sum().round(2)}).to_string())
         if "used_pct" in t.columns:
             print(f"\n분할: 평균 실제 물량 {t['used_pct'].mean():.0f}% · 추가분 체결률 {t['adds'].sum() / (len(t) * 2) * 100:.0f}% (백테스트: 59% · 40% 안팎)")
         print(f"\n배율 환산 (목표 1.5배): {(r * 1.5).sum()*100:+.1f}%  · 참고 1배 {r.sum()*100:+.1f}%")
