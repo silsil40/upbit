@@ -272,27 +272,32 @@ def seed_official(h, days=31):
 
 
 def verify_day(day, live_path=F_LIVE):
-    """어제 공식 파일 vs 실시간 계산 비교 → dict"""
+    """그날 공식 파일 vs 실시간 계산 비교 → dict(status=ok/공식없음/겹침부족, ...)"""
     s_off, snap = official_day(day)
-    if s_off is None or not os.path.exists(live_path):
-        return None
+    if s_off is None:
+        return dict(status="공식없음", day=str(day))
+    if not os.path.exists(live_path):
+        return dict(status="겹침부족", day=str(day), off_bars=int(s_off.notna().sum()), live_rows=0, overlap=0)
     L = pd.read_csv(live_path)
     L["t"] = pd.to_datetime(L["ts"], unit="ms", utc=True)
     t0 = pd.Timestamp(day, tz="UTC"); t1 = t0 + pd.Timedelta(days=1)
     L = L[(L["t"] > t0) & (L["t"] <= t1)]
-    if len(L) < 100:
-        return None
+    off_bars = int(s_off.notna().sum())
+    off_span = f"{snap.index.min():%H:%M}~{snap.index.max():%H:%M}" if len(snap) else "-"
+    if len(L) < 20:
+        return dict(status="겹침부족", day=str(day), off_bars=off_bars, off_span=off_span, live_rows=len(L), overlap=0)
     li = ((L["bid1"] - L["ask1"]) / (L["bid1"] + L["ask1"])).values
     s_live = pd.Series(li, index=L["t"]).resample("5min", label="right", closed="right").last()
     s_live.index = to_ms(s_live.index)
     j = pd.concat([s_off.rename("off"), s_live.rename("live")], axis=1).dropna()
-    if len(j) < 50:
-        return None
+    if len(j) < 24:                                   # 2시간 미만 겹치면 비교 의미 없음
+        return dict(status="겹침부족", day=str(day), off_bars=off_bars, off_span=off_span, live_rows=len(L), overlap=len(j))
     lvl = pd.concat([snap.resample("5min").last(), L.set_index("t")[["bid1", "ask1"]].resample("5min").last()],
                     axis=1, keys=["o", "l"]).dropna()
     ratio_b = float((lvl["l"]["bid1"] / lvl["o"]["bid1"]).median()) if len(lvl) else np.nan
-    return dict(day=str(day), n=len(j), corr=round(float(j["off"].corr(j["live"])), 4),
-                mean_abs_diff=round(float((j["off"] - j["live"]).abs().mean()), 4), bid_level_ratio=round(ratio_b, 3))
+    return dict(status="ok", day=str(day), n=len(j), corr=round(float(j["off"].corr(j["live"])), 4),
+                mean_abs_diff=round(float((j["off"] - j["live"]).abs().mean()), 4), bid_level_ratio=round(ratio_b, 3),
+                off_bars=off_bars)
 
 
 # ---------------------------------------------------------------- 실행
@@ -378,12 +383,17 @@ def run():
                     if str(day) in verified or day < live_start:
                         continue
                     v = verify_day(day)
-                    if v:
-                        append_csv(F_VER, [v]); verified.append(str(day)); verified[:] = verified[-30:]
+                    if v["status"] == "ok":
+                        append_csv(F_VER, [{k: v[k] for k in ("day", "n", "corr", "mean_abs_diff", "bid_level_ratio")}])
+                        verified.append(str(day)); verified[:] = verified[-30:]
                         log.info(f"[검증] {day} 공식 vs 실시간 — 상관 {v['corr']:.3f} · 평균 차이 {v['mean_abs_diff']:.4f} · "
                                  f"매수 금액 비율 {v['bid_level_ratio']} ({v['n']}개 봉)")
+                    elif v["status"] == "겹침부족":
+                        verified.append(str(day)); verified[:] = verified[-30:]           # 다시 시도해도 같으니 건너뜀
+                        log.info(f"[검증] {day} 건너뜀 — 공식 파일 5분봉 {v.get('off_bars', 0)}개({v.get('off_span', '-')} UTC) · "
+                                 f"실시간 {v.get('live_rows', 0)}행 · 겹치는 봉 {v.get('overlap', 0)}개 (2시간 미만이라 비교 불가)")
                     elif back == 1:
-                        log.info(f"[검증] {day} 공식 파일 아직 없음(또는 비교할 실시간 기록 부족) — 1시간 뒤 재시도")
+                        log.info(f"[검증] {day} 공식 파일 아직 안 올라옴 — 1시간 뒤 재시도")
                 save_state(dict(last_ts=last_ts, engine=eng.to_dict(), verified=verified))
             time.sleep(5)
         except Exception as e:
@@ -428,8 +438,7 @@ if __name__ == "__main__":
     if "--verify" in sys.argv:                      # 손으로 검증: venv/bin/python ob_bot.py --verify 2026-10-07
         d = sys.argv[sys.argv.index("--verify") + 1] if len(sys.argv) > sys.argv.index("--verify") + 1 else \
             str(dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1))
-        v = verify_day(dt.date.fromisoformat(d))
-        print(v if v else f"{d}: 공식 파일이 아직 없거나, 그날 실시간 기록이 부족함")
+        print(verify_day(dt.date.fromisoformat(d)))
     elif "--report" in sys.argv:
         report()
     else:
