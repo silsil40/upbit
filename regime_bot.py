@@ -30,6 +30,14 @@
  (6d) 로그 용량 상한: regime_bot.log 5MB×3개 회전, audit 20MB 초과 시 .old 로 교체.
       → 디스크/메모리 무한 증식 방지.
 
+★ 패치 (7) — 급변 차단기 (v4, 2026-10) ★
+ (7a) 15분 사이사이 WATCH_SEC(20초)마다 보유 코인 시세 감시.
+      롱: 현재 15분봉 기준가(직전 사이클 종가) 대비 -6% 이하 / 숏: +6% 이상 → 즉시 시장가 reduceOnly 전량청산.
+      청산 후 24시간 신규 진입 안 함(cool_until). 24시간 뒤 레짐이 그대로면 다음 사이클에 재진입.
+ (7b) 손절(-10%)도 같은 감시에서 확인 → 15분 마감까지 기다리지 않음(백테스트 가정과 일치). 손절 규칙 자체는 그대로.
+ (7c) 거래소 조건부 주문(STOP_MARKET)은 2025-12 Algo API 이전으로 쓰지 않음 — 검증된 시장가 청산 경로만 사용.
+ 근거: regime_improve_test.py — 1배 최악의 날 -26.1% → -9.0%, 샤프 0.87 → 0.93, 새 시장 성적 동일, 연 6.5회 발동.
+
 ★ 모드 ★
  - DRY_RUN=True  : 모의(공개시세+가상체결, 키 불필요). ← 기본값(안전)
  - DRY_RUN=False : 실거래(진짜 돈). 실계정 선물키 필요. systemd 권장.
@@ -52,6 +60,10 @@ VOL_TARGET_ANN = 0.40; VOL_WINDOW_D = 14
 STOP           = 0.10; REBAL_BAND = 0.10
 FEE, SLIP      = 0.0005, 0.0005
 KILL_DD        = 0.40; LEVERAGE = 1
+BRK            = 0.06                        # (7a) 급변 차단기: 15분봉 기준가 대비 ±6%
+COOL_HOURS     = 24                          # (7a) 차단기 청산 후 신규 진입 쉬는 시간
+WATCH_SEC      = 20                          # (7a) 사이클 사이 감시 간격(초)
+WATCH_STOP     = True                        # (7b) 손절(-10%)도 감시 루프에서 확인
 START_EQUITY   = 10000.0                    # 드라이런 가상 시작 잔고
 WARMUP_BARS    = LD * BARS_DAY + 600
 LOOP_BUFFER_S  = 20
@@ -166,6 +178,10 @@ def load_state():
     for s in SYMBOLS:                          # 누락 키 보정
         st["coins"].setdefault(s, {"tsign": 0.0, "stopped": False, "held_sign": 0.0})
         st["coins"][s].setdefault("stopped", False)
+        st["coins"][s].setdefault("cool_until", 0.0)     # (7a) 차단기 휴식 종료 시각(epoch 초)
+        st["coins"][s]["bar_ref"] = 0.0                  # (7a) 감시 기준가 — 매 실행 첫 사이클에서 새로 설정
+        st["coins"][s]["watch_qty"] = 0.0
+        st["coins"][s]["watch_entry"] = 0.0
         st["coins"][s].setdefault("tsign", 0.0)
         st["coins"][s].setdefault("held_sign", 0.0)
     st.setdefault("equity_peak", 0.0)
@@ -420,8 +436,12 @@ def cycle(ex, st):
                     cs["stopped"] = True
             if sgn != cs["tsign"]:
                 cs["stopped"] = False; cs["tsign"] = sgn
-            desired = 0.0 if cs["stopped"] else sgn * size
+            cooling = time.time() < float(cs.get("cool_until", 0.0) or 0.0)     # (7a)
+            desired = 0.0 if (cs["stopped"] or cooling) else sgn * size
             regime = {1.0:"롱",-1.0:"숏",0.0:"현금"}[sgn]
+            if cooling:
+                left_h = (float(cs["cool_until"]) - time.time()) / 3600
+                log.info(f"{s} 급변 차단기 휴식 중 (남은 {left_h:.1f}시간) - 신규 진입 안 함")
 
             action, reason, verify, cur_after = "HOLD", "밴드내", "NA", cur_qty
             target_qty = cur_qty
@@ -451,6 +471,9 @@ def cycle(ex, st):
             else:
                 qty_now, entry_now = cur_qty, entry
             log_position(s, qty_now, entry_now, price)
+            cs["bar_ref"] = float(price)                 # (7a) 감시 기준가 = 이번 사이클 종가(≈ 새 15분봉 시가)
+            cs["watch_qty"] = float(qty_now)
+            cs["watch_entry"] = float(entry_now or 0.0)
 
             audit({"event":"cycle","symbol":s,"regime":regime,"stopped":cs["stopped"],
                    "entry":round(entry,2),"cur_frac":round(cur_frac,4),
@@ -463,11 +486,64 @@ def cycle(ex, st):
     save_state(st)
 
 
+# ===================== (7) 급변 차단기 감시 =====================
+def watch_once(ex, st):
+    """사이클 사이 감시: 보유 중인 코인만 티커 1회씩. 조건 충족 시 시장가 reduceOnly 전량청산."""
+    if st.get("halted"):
+        return
+    for s in SYMBOLS:
+        try:
+            cs = st["coins"][s]
+            qty = float(cs.get("watch_qty", 0.0) or 0.0)
+            if qty == 0:
+                continue
+            t = ex.fetch_ticker(s)
+            price = float(t.get("last") or t.get("close"))
+            ref = float(cs.get("bar_ref", 0.0) or 0.0)
+            entry = float(cs.get("watch_entry", 0.0) or 0.0)
+            d = 1.0 if qty > 0 else -1.0
+            move = (price / ref - 1.0) if ref > 0 else 0.0
+            trig_brk = ref > 0 and d * move <= -BRK
+            trig_stop = WATCH_STOP and entry > 0 and d * (price / entry - 1.0) <= -STOP
+            if not (trig_brk or trig_stop):
+                continue
+            cur_qty, cur_entry = get_position(ex, st, s)
+            if cur_qty == 0:
+                cs["watch_qty"] = 0.0; save_state(st); continue
+            why = "급변 차단기" if trig_brk else "손절(-10%)"
+            log.warning(f"!! {s} {why} 발동: 기준가 {ref:.4f} → 현재 {price:.4f} ({move*100:+.2f}%) "
+                        f"| 진입가 대비 {d*(price/entry-1)*100 if entry > 0 else 0:+.2f}% → 전량청산")
+            if DRY_RUN:
+                st["sim"]["price"][s] = price
+            action, reason = place_to(ex, st, s, 0.0, cur_qty, price, cur_entry)
+            if action == "TRADE":
+                verify, after = verify_position(ex, st, s, 0.0)
+                cs["watch_qty"] = float(after)
+                cs["held_sign"] = float(np.sign(after))
+                (log.info if verify == "MATCH" else log.error)(f"  {s} {why} 청산 체결검증={verify} (실제={after})")
+            else:
+                log.error(f"  {s} {why} 청산 실패/보류: {action} {reason} - 다음 감시에서 재시도")
+            if trig_stop:
+                cs["stopped"] = True                    # 기존 손절 규칙: 레짐 바뀔 때까지 재진입 안 함
+            if trig_brk:
+                cs["cool_until"] = time.time() + COOL_HOURS * 3600
+                log.warning(f"  {s} {COOL_HOURS}시간 신규 진입 휴식 (해제 {datetime.fromtimestamp(cs['cool_until'], timezone.utc):%Y-%m-%d %H:%M} UTC)")
+            audit({"event": "breaker" if trig_brk else "watch_stop", "symbol": s, "ref": ref, "price": price,
+                   "entry": entry, "move": round(move, 5), "qty": cur_qty, "action": action, "reason": reason})
+            save_state(st)
+        except Exception as e:
+            log.exception(f"{s} 감시 에러(계속): {e}")
+
+
 # ===================== 메인 =====================
-def sleep_to_next_bar():
+def sleep_to_next_bar(ex=None, st=None):
     now = time.time(); period = 15 * 60
     nxt = (math.floor(now / period) + 1) * period + LOOP_BUFFER_S
+    last_watch = 0.0
     while _RUNNING and time.time() < nxt:
+        if ex is not None and st is not None and time.time() - last_watch >= WATCH_SEC:
+            last_watch = time.time()
+            watch_once(ex, st)                           # (7a) 사이클 사이 감시
         time.sleep(min(5, max(0.1, nxt - time.time())))
 
 def reconcile_startup(ex, st):
@@ -500,7 +576,7 @@ def main():
         except Exception as e:
             log.exception(f"사이클 에러(계속): {e}")
             audit({"event":"error","error":str(e)})
-        if _RUNNING: sleep_to_next_bar()
+        if _RUNNING: sleep_to_next_bar(ex, st)
     log.info("정지됨.")
 
 
