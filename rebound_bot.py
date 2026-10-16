@@ -83,13 +83,23 @@ def klines(sym, start_s, end_s=None):
 
 
 def oi_hist(sym, start_s, end_s):
+    """[start_s, end_s] 구간 5분 OI. 요청 구간 밖 값(API 가 최근 값을 대신 줄 때)은 버리고,
+    시각이 앞으로 안 나가면 멈춤 — 무한 반복 방지 (요청 최대 80번)"""
     out, cur = {}, start_s
-    while cur < end_s:
+    for _ in range(80):
+        if cur >= end_s:
+            break
+        hi = min(end_s, cur + 500 * BAR)
         j = http("/futures/data/openInterestHist", {"symbol": sym, "period": "5m", "limit": 500,
-                                                   "startTime": int(cur * 1000), "endTime": int(min(end_s, cur + 500 * BAR) * 1000)})
-        for r in j:
-            out[int(r["timestamp"]) // 1000] = float(r["sumOpenInterest"])
-        cur = (max(out) + 1) if j else cur + 500 * BAR
+                                                   "startTime": int(cur * 1000), "endTime": int(hi * 1000)})
+        got = [(int(r["timestamp"]) // 1000, float(r["sumOpenInterest"])) for r in j]
+        got = [(t, v) for t, v in got if cur <= t <= hi]
+        if got:
+            out.update(got)
+            nxt = max(t for t, _ in got) + 1
+            cur = nxt if nxt > cur else hi + 1
+        else:
+            cur = hi + 1
         time.sleep(0.2)
     return out
 
