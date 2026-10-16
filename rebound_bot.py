@@ -22,7 +22,7 @@ OI 시점: 백테스트처럼 '봉 b 시점 OI' 를 봉 b 가 닫힌 뒤(b+5분)
 
 실행: 서버에서는 rebound_bot.py 로 저장 → ./restart_rebound.sh  (start/stop/stats_rebound.sh 그대로 사용)
       python3 rebound_bot.py --report  (성적표만 출력, --stats 도 같음)
-환경변수: RB2_OI_OFFSET (기본 0)
+환경변수: RB2_OI_OFFSET (기본 -1 — 봉 b 에 API 시각 b+5분 OI 를 씀. 2026-10 확인)
 """
 
 import os, sys, json, time, math, csv, logging, urllib.request, urllib.parse
@@ -38,7 +38,7 @@ HOLD, WIN = 12, 12
 COST_T, MAKER, TICK = 0.0008, 0.0002, 0.0001
 STOP, STOP_SLIP = 0.15, 0.002
 Z_TH = -2.0
-OI_OFFSET = int(os.environ.get("RB2_OI_OFFSET", "0"))
+OI_OFFSET = int(os.environ.get("RB2_OI_OFFSET", "-1"))     # rebound2_check B: 비전 'b' = API 'b+5분' (SOL·XRP 상관 1.000)
 OI_WAIT = 240
 CATCHUP_MAX = 2               # 이보다 오래된 봉에서 난 신호는 진입 안 함 (재시작·지연 후 따라잡기)
 METHODS = {"L3": [("lim", 0.005, 1 / 3), ("lim", 0.010, 1 / 3), ("lim", 0.020, 1 / 3)],
